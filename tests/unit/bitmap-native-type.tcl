@@ -245,6 +245,33 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal 1 [r bitcount bitmap:string:bounds]
     }
 
+    test {bitmap offset limit follows proto-max-bulk-len config} {
+        set limit 1048576
+        set oldval [config_get_set proto-max-bulk-len $limit]
+        set last_allowed [expr {$limit * 8 - 1}]
+        set first_rejected [expr {$limit * 8}]
+
+        r del bitmap:native:small-limit
+        r config set bitmap-default-roaring yes
+        assert_equal 0 [r setbit bitmap:native:small-limit $last_allowed 1]
+        assert_equal 1 [r getbit bitmap:native:small-limit $last_allowed]
+
+        foreach cmd [list \
+            [list getbit bitmap:native:small-limit $first_rejected] \
+            [list setbit bitmap:native:small-limit $first_rejected 1] \
+            [list bitfield_ro bitmap:native:small-limit GET u1 $first_rejected] \
+            [list bitfield bitmap:native:small-limit SET u1 $first_rejected 1] \
+            [list bitfield bitmap:native:small-limit SET u2 $last_allowed 3] \
+        ] {
+            assert_error {*bit offset is not an integer or out of range*} {r {*}$cmd}
+        }
+        assert_equal 1 [r bitcount bitmap:native:small-limit]
+
+        r config set bitmap-default-roaring no
+        r config set proto-max-bulk-len $oldval
+        r del bitmap:native:small-limit
+    }
+
     test {WATCH aborts the transaction when bitmap-default-roaring converts the key} {
         r config set bitmap-default-roaring yes
 
@@ -300,6 +327,38 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal {pmessage __keyevent@9__:* __keyevent@9__:type_changed bitmap:public:notify:cmd} [$rd read]
 
         $rd close
+        r config set notify-keyspace-events {}
+    }
+
+    test {native bitmap writes use only the bitmap notification class} {
+        r config set bitmap-default-roaring no
+        r del bitmap:notify:native-dollar bitmap:notify:string-dollar \
+            bitmap:notify:string-bitmap bitmap:notify:native-bitmap \
+            bitmap:notify:native-all
+
+        set rd [redis_deferring_client]
+        $rd psubscribe __keyevent@9__:*
+        $rd read
+
+        r config set notify-keyspace-events E\$
+        r config set bitmap-default-roaring yes
+        r setbit bitmap:notify:native-dollar 0 1
+        r config set bitmap-default-roaring no
+        r setbit bitmap:notify:string-dollar 0 1
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:setbit bitmap:notify:string-dollar} [$rd read]
+
+        r config set notify-keyspace-events Eb
+        r setbit bitmap:notify:string-bitmap 0 1
+        r config set bitmap-default-roaring yes
+        r setbit bitmap:notify:native-bitmap 0 1
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:setbit bitmap:notify:native-bitmap} [$rd read]
+
+        r config set notify-keyspace-events EA
+        r setbit bitmap:notify:native-all 0 1
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:setbit bitmap:notify:native-all} [$rd read]
+
+        $rd close
+        r config set bitmap-default-roaring no
         r config set notify-keyspace-events {}
     }
 

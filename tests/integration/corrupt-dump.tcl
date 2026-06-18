@@ -1237,6 +1237,13 @@ test {corrupt payload: bitmap raw RDB length validation} {
         assert_match "*Bad data format*" $err
         assert_equal PONG [r ping]
 
+        set old_bulk_len [config_get_set proto-max-bulk-len 1048576]
+        set configured_huge_len_payload [bitmap_dump_payload $bitmap_type 1048577 $valid_raw $dump_trailer]
+        catch { r restore bitmap:configured-huge-len 0 $configured_huge_len_payload } err
+        assert_match "*Bad data format*" $err
+        assert_equal PONG [r ping]
+        r config set proto-max-bulk-len $old_bulk_len
+
         set valid_payload [bitmap_dump_payload $bitmap_type 2 $valid_raw $dump_trailer]
 
         r config set sanitize-dump-payload yes
