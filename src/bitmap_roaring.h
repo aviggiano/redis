@@ -3,7 +3,6 @@
 
 #include "sds.h"
 #include "object.h"
-#include "rio.h"
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -21,8 +20,6 @@ void bitmapRoaringInit(void);
 robj *createBitmapObject(void);
 robj *createBitmapObjectFromString(const unsigned char *buf, size_t len);
 robj *createBitmapObjectFromPortable(uint64_t byte_len, const char *buf, size_t len, int deep_validate);
-ssize_t bitmapObjectSaveRdb(rio *rdb, const robj *o);
-robj *createBitmapObjectFromRdb(rio *rdb, int deep_validate);
 robj *bitmapTypeDup(const robj *o);
 void freeBitmapObject(robj *o);
 void dismissBitmapObject(robj *o, size_t size_hint);

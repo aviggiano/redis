@@ -1200,15 +1200,15 @@ test {corrupt payload: bitmap with unsorted array container} {
     # are reversed to {9,5,1}. That stays within deserialization bounds but
     # violates the sorted-array invariant, so only deep sanitization rejects it.
     # Payload layout: type byte RDB_TYPE_BITMAP, logical byte length,
-    # container count, then per container high48/type/cardinality/raw payload,
-    # 2-byte RDB version, 8-byte CRC (stale in the corrupted variants;
-    # checksum validation is skipped above).
+    # portable CRoaring payload, 2-byte RDB version, 8-byte CRC (stale in the
+    # corrupted variants; checksum validation is skipped above).
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r debug set-skip-checksum-validation 1
         r setbit bitmap:type-probe 1 1
         r bitmap convert bitmap:type-probe
         set bitmap_probe_dump [r dump bitmap:type-probe]
         binary scan $bitmap_probe_dump H2 bitmap_type
+        set dump_trailer [string range $bitmap_probe_dump end-9 end]
         r del bitmap:type-probe
 
         proc bitmap_rdb_len {len} {
@@ -1223,26 +1223,35 @@ test {corrupt payload: bitmap with unsorted array container} {
             }
         }
 
-        set huge_byte_len [expr {(1 << 60) - 1}]
-        set huge_container_count [expr {(($huge_byte_len - 1) / 8192) + 1}]
-        set huge_count_payload [binary format H* ${bitmap_type}]
-        append huge_count_payload [bitmap_rdb_len $huge_byte_len]
-        append huge_count_payload [bitmap_rdb_len $huge_container_count]
-        append huge_count_payload [string range $bitmap_probe_dump end-9 end]
+        proc bitmap_dump_payload {bitmap_type byte_len portable trailer} {
+            set payload [binary format H* $bitmap_type]
+            append payload [bitmap_rdb_len $byte_len]
+            append payload [bitmap_rdb_len [string length $portable]]
+            append payload $portable
+            append payload $trailer
+            return $payload
+        }
 
-        catch { r restore bitmap:huge-count 0 $huge_count_payload } err
+        set valid_portable [binary format H* 0100000000000000000000003a300000010000000000020010000000010005000900]
+        set unsorted_portable [binary format H* 0100000000000000000000003a300000010000000000020010000000090005000100]
+
+        set huge_len_payload [bitmap_dump_payload $bitmap_type [expr {1 << 60}] $valid_portable $dump_trailer]
+
+        catch { r restore bitmap:huge-len 0 $huge_len_payload } err
         assert_match "*Bad data format*" $err
         assert_equal PONG [r ping]
 
-        set valid_payload    [binary format H* ${bitmap_type}0201000203060100050009000f006d1435120f203a9e]
-        set unsorted_payload [binary format H* ${bitmap_type}0201000203060900050001000f006d1435120f203a9e]
+        set valid_payload [bitmap_dump_payload $bitmap_type 2 $valid_portable $dump_trailer]
+        set unsorted_payload [bitmap_dump_payload $bitmap_type 2 $unsorted_portable $dump_trailer]
 
         r config set sanitize-dump-payload yes
         r restore bitmap:valid 0 $valid_payload
         assert_equal [r type bitmap:valid] bitmap
         assert_equal [r debug bitmap-raw bitmap:valid] [binary format H* 4440]
 
-        set trailing_payload [binary format H* ${bitmap_type}020100020307010005000900000f006d1435120f203a9e]
+        set trailing_portable $valid_portable
+        append trailing_portable [binary format c 0]
+        set trailing_payload [bitmap_dump_payload $bitmap_type 2 $trailing_portable $dump_trailer]
         catch { r restore bitmap:trailing 0 $trailing_payload } err
         assert_match "*Bad data format*" $err
 

@@ -299,14 +299,14 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         r config set bitmap-default-roaring no
         r del bitmap:public:notify bitmap:public:notify:conv bitmap:public:notify:cmd
 
-        r config set notify-keyspace-events E\$ocn
+        r config set notify-keyspace-events E\$ocnb
         set rd [redis_deferring_client]
         $rd psubscribe __keyevent@9__:*
         $rd read
 
-        # Direct native creation in bitmap-default-roaring yes: same event sequence as a
-        # legacy creating SETBIT ("new" then "setbit") - the type difference
-        # is invisible at the notification surface.
+        # Direct native creation in bitmap-default-roaring yes: same event
+        # names as a legacy creating SETBIT ("new" then "setbit"), with the
+        # write event classified under the bitmap notification class.
         r config set bitmap-default-roaring yes
         r setbit bitmap:public:notify $::sparse_public_offset 1
         assert_equal {pmessage __keyevent@9__:* __keyevent@9__:new bitmap:public:notify} [$rd read]

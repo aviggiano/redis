@@ -988,9 +988,7 @@ NULL
     {
         server.skip_checksum_validation = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr,"bitmap-raw") &&
-               c->argc == 3)
-    {
+    } else if (!strcasecmp(c->argv[1]->ptr,"bitmap-raw") && c->argc == 3) {
         kvobj *kv = lookupKeyReadOrReply(c, c->argv[2], shared.nokeyerr);
         if (kv == NULL || checkType(c, kv, OBJ_BITMAP)) return;
 

@@ -1117,6 +1117,39 @@ static ssize_t rdbSaveArraySlice(rio *rdb, arSlice *s, uint64_t slice_id,
     return nwritten;
 }
 
+static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
+    ssize_t n, nwritten = 0;
+
+    if ((n = rdbSaveLen(rdb, bitmapObjectLen(o))) == -1) return -1;
+    nwritten += n;
+
+    sds payload = bitmapObjectSerialize(o);
+    if ((n = rdbSaveRawString(rdb, (unsigned char *)payload,
+                              sdslen(payload))) == -1) {
+        sdsfree(payload);
+        return -1;
+    }
+    nwritten += n;
+    sdsfree(payload);
+
+    return nwritten;
+}
+
+static robj *rdbLoadBitmapObject(rio *rdb, int deep_validate) {
+    uint64_t byte_len = rdbLoadLen(rdb, NULL);
+    if (byte_len == RDB_LENERR) return NULL;
+    if (byte_len > BITMAP_OBJECT_MAX_BYTES) return NULL;
+
+    size_t payload_len;
+    sds payload = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, &payload_len);
+    if (payload == NULL) return NULL;
+
+    robj *o = createBitmapObjectFromPortable(byte_len, payload, payload_len,
+                                             deep_validate);
+    sdsfree(payload);
+    return o;
+}
+
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
     ssize_t n = 0, nwritten = 0;
 
@@ -1564,7 +1597,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             }
         }
     } else if (o->type == OBJ_BITMAP) {
-        if ((n = bitmapObjectSaveRdb(rdb, o)) == -1) return -1;
+        if ((n = rdbSaveBitmapObject(rdb, o)) == -1) return -1;
         nwritten += n;
     } else {
         serverPanic("Unknown object type");
@@ -3905,7 +3938,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         }
     } else if (rdbtype == RDB_TYPE_BITMAP) {
         if (deep_integrity_validation) server.stat_dump_payload_sanitizations++;
-        o = createBitmapObjectFromRdb(rdb, deep_integrity_validation);
+        o = rdbLoadBitmapObject(rdb, deep_integrity_validation);
         if (o == NULL) {
             rdbReportCorruptRDB("Invalid bitmap RDB payload");
             return NULL;
