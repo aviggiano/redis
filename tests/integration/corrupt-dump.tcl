@@ -1195,13 +1195,10 @@ test {corrupt payload: stream consumer group with overflowing entries_read} {
     }
 }
 
-test {corrupt payload: bitmap with unsorted array container} {
-    # Native bitmap (Roaring) DUMP of {1,5,9}; the array container's values
-    # are reversed to {9,5,1}. That stays within deserialization bounds but
-    # violates the sorted-array invariant, so only deep sanitization rejects it.
-    # Payload layout: type byte RDB_TYPE_BITMAP, logical byte length,
-    # portable CRoaring payload, 2-byte RDB version, 8-byte CRC (stale in the
-    # corrupted variants; checksum validation is skipped above).
+test {corrupt payload: bitmap raw RDB length validation} {
+    # Payload layout: type byte RDB_TYPE_BITMAP, logical byte length, raw
+    # bitmap bytes, 2-byte RDB version, 8-byte CRC (stale in the corrupted
+    # variants; checksum validation is skipped above).
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r debug set-skip-checksum-validation 1
         r setbit bitmap:type-probe 1 1
@@ -1223,47 +1220,44 @@ test {corrupt payload: bitmap with unsorted array container} {
             }
         }
 
-        proc bitmap_dump_payload {bitmap_type byte_len portable trailer} {
+        proc bitmap_dump_payload {bitmap_type byte_len raw trailer} {
             set payload [binary format H* $bitmap_type]
             append payload [bitmap_rdb_len $byte_len]
-            append payload [bitmap_rdb_len [string length $portable]]
-            append payload $portable
+            append payload [bitmap_rdb_len [string length $raw]]
+            append payload $raw
             append payload $trailer
             return $payload
         }
 
-        set valid_portable [binary format H* 0100000000000000000000003a300000010000000000020010000000010005000900]
-        set unsorted_portable [binary format H* 0100000000000000000000003a300000010000000000020010000000090005000100]
+        set valid_raw [binary format H* 4440]
 
-        set huge_len_payload [bitmap_dump_payload $bitmap_type [expr {1 << 60}] $valid_portable $dump_trailer]
+        set huge_len_payload [bitmap_dump_payload $bitmap_type [expr {512 * 1024 * 1024 + 1}] $valid_raw $dump_trailer]
 
         catch { r restore bitmap:huge-len 0 $huge_len_payload } err
         assert_match "*Bad data format*" $err
         assert_equal PONG [r ping]
 
-        set valid_payload [bitmap_dump_payload $bitmap_type 2 $valid_portable $dump_trailer]
-        set unsorted_payload [bitmap_dump_payload $bitmap_type 2 $unsorted_portable $dump_trailer]
+        set valid_payload [bitmap_dump_payload $bitmap_type 2 $valid_raw $dump_trailer]
 
         r config set sanitize-dump-payload yes
         r restore bitmap:valid 0 $valid_payload
         assert_equal [r type bitmap:valid] bitmap
-        assert_equal [r debug bitmap-raw bitmap:valid] [binary format H* 4440]
+        assert_equal [r debug bitmap-raw bitmap:valid] $valid_raw
 
-        set trailing_portable $valid_portable
-        append trailing_portable [binary format c 0]
-        set trailing_payload [bitmap_dump_payload $bitmap_type 2 $trailing_portable $dump_trailer]
-        catch { r restore bitmap:trailing 0 $trailing_payload } err
+        set short_payload [bitmap_dump_payload $bitmap_type 3 $valid_raw $dump_trailer]
+        catch { r restore bitmap:short 0 $short_payload } err
         assert_match "*Bad data format*" $err
 
-        catch { r restore bitmap:corrupt 0 $unsorted_payload } err
+        set long_raw $valid_raw
+        append long_raw [binary format c 0]
+        set long_payload [bitmap_dump_payload $bitmap_type 2 $long_raw $dump_trailer]
+        catch { r restore bitmap:long 0 $long_payload } err
         assert_match "*Bad data format*" $err
 
-        # Without deep sanitization the payload deserializes within bounds and
-        # is accepted; the structural check is deep-only, like listpack deep
-        # validation.
         r config set sanitize-dump-payload no
-        r restore bitmap:shallow 0 $unsorted_payload
+        r restore bitmap:shallow 0 $valid_payload
         assert_equal [r type bitmap:shallow] bitmap
+        assert_equal [r debug bitmap-raw bitmap:shallow] $valid_raw
         r del bitmap:shallow
     }
 }

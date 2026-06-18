@@ -1123,7 +1123,10 @@ static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
     if ((n = rdbSaveLen(rdb, bitmapObjectLen(o))) == -1) return -1;
     nwritten += n;
 
-    sds payload = bitmapObjectSerialize(o);
+    sds payload = bitmapObjectMaterialize(o);
+    if (payload == NULL) return -1;
+    serverAssert((uint64_t)sdslen(payload) == bitmapObjectLen(o));
+
     if ((n = rdbSaveRawString(rdb, (unsigned char *)payload,
                               sdslen(payload))) == -1) {
         sdsfree(payload);
@@ -1136,16 +1139,22 @@ static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
 }
 
 static robj *rdbLoadBitmapObject(rio *rdb, int deep_validate) {
+    UNUSED(deep_validate);
     uint64_t byte_len = rdbLoadLen(rdb, NULL);
     if (byte_len == RDB_LENERR) return NULL;
     if (byte_len > BITMAP_OBJECT_MAX_BYTES) return NULL;
+    if (byte_len > (uint64_t)server.proto_max_bulk_len) return NULL;
 
     size_t payload_len;
     sds payload = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, &payload_len);
     if (payload == NULL) return NULL;
 
-    robj *o = createBitmapObjectFromPortable(byte_len, payload, payload_len,
-                                             deep_validate);
+    if ((uint64_t)payload_len != byte_len) {
+        sdsfree(payload);
+        return NULL;
+    }
+
+    robj *o = createBitmapObjectFromString((unsigned char *)payload, payload_len);
     sdsfree(payload);
     return o;
 }

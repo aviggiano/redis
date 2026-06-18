@@ -19,15 +19,9 @@
 
 #include "server.h"
 #include "bitmap_roaring.h"
-#include "endianconv.h"
-#include "rdb.h"
 
-/* Native bitmaps always support 64-bit indexing: the maximum addressable bit
- * offset is what the protocol can express as a non-negative signed 64-bit
- * integer, independent of proto-max-bulk-len. Legacy string bitmaps remain
- * bounded by proto-max-bulk-len; the per-command offset checks in bitops.c
- * enforce that split (reads accept 64-bit offsets on either representation,
- * writes only on native bitmaps). */
+/* Native bitmaps use Roaring internally, but public bitmap commands keep the
+ * same proto-max-bulk-len offset limit as legacy string bitmaps. */
 typedef struct bitmapObject {
     uint64_t byte_len;
     size_t alloc_size;          /* Total memory used by this bitmap object. */
@@ -146,153 +140,6 @@ static roaring64_bitmap_t *bitmapObjectRoaringFromString(const unsigned char *bu
     return roaring;
 }
 
-/* The converters below are compiled on every architecture, even though the
- * save/load call sites only need them on big-endian hosts: DEBUG
- * BITMAP-ENDIAN-CHECK round-trips payloads through them so the parser gets CI
- * coverage on little-endian builds instead of shipping untested. */
-static uint16_t bitmapPortableRead16(const char *p, int from_little_endian) {
-    uint16_t v;
-    memcpy(&v, p, sizeof(v));
-    return from_little_endian ? intrev16(v) : v;
-}
-
-static uint32_t bitmapPortableRead32(const char *p, int from_little_endian) {
-    uint32_t v;
-    memcpy(&v, p, sizeof(v));
-    return from_little_endian ? intrev32(v) : v;
-}
-
-static uint64_t bitmapPortableRead64(const char *p, int from_little_endian) {
-    uint64_t v;
-    memcpy(&v, p, sizeof(v));
-    return from_little_endian ? intrev64(v) : v;
-}
-
-/* Convert one embedded 32-bit Roaring portable bitmap between host and little
- * endianness in place. Parses at most 'len' bytes from 'buf' and stores the
- * number of bytes the bitmap occupies in '*consumed'. */
-static int bitmapPortableConvertEndian32(char *buf, size_t len,
-                                         int from_little_endian,
-                                         size_t *consumed)
-{
-    size_t pos = 0;
-
-    if (len < sizeof(uint32_t)) return C_ERR;
-    uint32_t cookie = bitmapPortableRead32(buf, from_little_endian);
-    memrev32(buf);
-    pos += sizeof(uint32_t);
-
-    int32_t size;
-    int hasrun;
-    if ((cookie & 0xFFFF) == SERIAL_COOKIE) {
-        size = (int32_t)((cookie >> 16) + 1);
-        hasrun = 1;
-    } else if (cookie == SERIAL_COOKIE_NO_RUNCONTAINER) {
-        if (len - pos < sizeof(uint32_t)) return C_ERR;
-        size = (int32_t)bitmapPortableRead32(buf + pos, from_little_endian);
-        memrev32(buf + pos);
-        pos += sizeof(uint32_t);
-        hasrun = 0;
-    } else {
-        return C_ERR;
-    }
-    if (size < 0 || size > (1 << 16)) return C_ERR;
-
-    char *runmap = NULL;
-    if (hasrun) {
-        size_t runmap_len = ((size_t)size + 7) / 8;
-        if (len - pos < runmap_len) return C_ERR;
-        runmap = buf + pos;
-        pos += runmap_len;
-    }
-
-    size_t keycard_len = (size_t)size * 2 * sizeof(uint16_t);
-    if (len - pos < keycard_len) return C_ERR;
-    char *keycards = buf + pos;
-    pos += keycard_len;
-
-    if ((!hasrun) || (size >= NO_OFFSET_THRESHOLD)) {
-        size_t offsets_len = (size_t)size * sizeof(uint32_t);
-        if (len - pos < offsets_len) return C_ERR;
-        for (int32_t i = 0; i < size; i++)
-            memrev32(buf + pos + (size_t)i * sizeof(uint32_t));
-        pos += offsets_len;
-    }
-
-    for (int32_t i = 0; i < size; i++) {
-        char *key = keycards + (size_t)i * 2 * sizeof(uint16_t);
-        char *cardp = key + sizeof(uint16_t);
-        uint32_t cardinality = (uint32_t)bitmapPortableRead16(cardp, from_little_endian) + 1;
-        int isbitmap = cardinality > DEFAULT_MAX_SIZE;
-        int isrun = 0;
-
-        memrev16(key);
-        memrev16(cardp);
-
-        if (hasrun && (runmap[i / 8] & (1 << (i % 8)))) {
-            isbitmap = 0;
-            isrun = 1;
-        }
-
-        if (isbitmap) {
-            size_t words_len = BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
-            if (len - pos < words_len) return C_ERR;
-            for (size_t j = 0; j < BITSET_CONTAINER_SIZE_IN_WORDS; j++)
-                memrev64(buf + pos + j * sizeof(uint64_t));
-            pos += words_len;
-        } else if (isrun) {
-            if (len - pos < sizeof(uint16_t)) return C_ERR;
-            uint16_t runs = bitmapPortableRead16(buf + pos, from_little_endian);
-            memrev16(buf + pos);
-            pos += sizeof(uint16_t);
-            if (runs > (len - pos) / (2 * sizeof(uint16_t))) return C_ERR;
-            for (uint32_t j = 0; j < (uint32_t)runs * 2; j++)
-                memrev16(buf + pos + (size_t)j * sizeof(uint16_t));
-            pos += (size_t)runs * 2 * sizeof(uint16_t);
-        } else {
-            if (cardinality > (len - pos) / sizeof(uint16_t)) return C_ERR;
-            for (uint32_t j = 0; j < cardinality; j++)
-                memrev16(buf + pos + (size_t)j * sizeof(uint16_t));
-            pos += (size_t)cardinality * sizeof(uint16_t);
-        }
-    }
-
-    *consumed = pos;
-    return C_OK;
-}
-
-/* CRoaring's portable format is host-endian despite being byte-compatible
- * with the Roaring format spec on little-endian hosts. Redis RDB payloads
- * must be architecture-portable, so big-endian builds translate the CRoaring
- * payload to little-endian before saving and back to host-endian before
- * deserializing. The 64-bit framing is a u64 bucket count followed by, per
- * bucket, a u32 high key and an embedded 32-bit portable bitmap (see
- * RoaringFormatSpec, "extension for 64-bit implementations"). */
-static int bitmapPortableConvertEndian(char *buf, size_t len, int from_little_endian) {
-    size_t pos = 0;
-
-    if (len < sizeof(uint64_t)) return C_ERR;
-    uint64_t buckets = bitmapPortableRead64(buf, from_little_endian);
-    memrev64(buf);
-    pos += sizeof(uint64_t);
-    if (buckets > UINT32_MAX) return C_ERR;
-
-    for (uint64_t i = 0; i < buckets; i++) {
-        if (len - pos < sizeof(uint32_t)) return C_ERR;
-        memrev32(buf + pos);
-        pos += sizeof(uint32_t);
-
-        size_t consumed;
-        if (bitmapPortableConvertEndian32(buf + pos, len - pos,
-                                          from_little_endian,
-                                          &consumed) != C_OK)
-            return C_ERR;
-        pos += consumed;
-    }
-
-    return pos == len ? C_OK : C_ERR;
-}
-
 static int bitmapRoaringNormalizeAlignment(size_t *alignment) {
     size_t normalized;
 
@@ -397,58 +244,6 @@ robj *createBitmapObjectFromString(const unsigned char *buf, size_t len) {
     bitmap->roaring = bitmapObjectRoaringFromString(buf, len, 1);
     bitmap->alloc_size = bitmap_alloc_size +
                          bitmapRoaringAllocSize(bitmap->roaring);
-
-    robj *o = createObject(OBJ_BITMAP, bitmap);
-    o->encoding = OBJ_ENCODING_BITMAP_ROARING;
-    return o;
-}
-
-robj *createBitmapObjectFromPortable(uint64_t byte_len, const char *buf, size_t len, int deep_validate) {
-    if (byte_len > BITMAP_OBJECT_MAX_BYTES) return NULL;
-
-    const char *portable = buf;
-    sds converted = NULL;
-#if (BYTE_ORDER == BIG_ENDIAN)
-    converted = sdsnewlen(buf, len);
-    if (bitmapPortableConvertEndian(converted, len, 1) != C_OK) {
-        sdsfree(converted);
-        return NULL;
-    }
-    portable = converted;
-#else
-    if (roaring64_bitmap_portable_deserialize_size(buf, len) != len) return NULL;
-#endif
-
-    roaring64_bitmap_t *roaring =
-        roaring64_bitmap_portable_deserialize_safe(portable, len);
-    sdsfree(converted);
-    if (roaring == NULL) return NULL;
-
-    /* The safe deserializer bounds the reads but does not verify structural
-     * invariants (sorted array containers, sorted non-overlapping runs);
-     * CRoaring documents bitmaps from untrusted input as unsafe to use until
-     * roaring64_bitmap_internal_validate passes. */
-    if (deep_validate) {
-        const char *reason = NULL;
-        if (!roaring64_bitmap_internal_validate(roaring, &reason)) {
-            roaring64_bitmap_free(roaring);
-            return NULL;
-        }
-    }
-
-    if (roaring64_bitmap_get_cardinality(roaring) != 0) {
-        uint64_t max = roaring64_bitmap_maximum(roaring);
-        if (max >= byte_len * 8) {
-            roaring64_bitmap_free(roaring);
-            return NULL;
-        }
-    }
-
-    size_t bitmap_alloc_size = 0;
-    bitmapObject *bitmap = zmalloc_usable(sizeof(*bitmap), &bitmap_alloc_size);
-    bitmap->byte_len = byte_len;
-    bitmap->roaring = roaring;
-    bitmap->alloc_size = bitmap_alloc_size + bitmapRoaringAllocSize(roaring);
 
     robj *o = createObject(OBJ_BITMAP, bitmap);
     o->encoding = OBJ_ENCODING_BITMAP_ROARING;
@@ -1032,9 +827,7 @@ static sds bitmapObjectMaterializeRoaring(const roaring64_bitmap_t *roaring,
 }
 
 /* Flatten the bitmap into its logical raw string bytes. Returns NULL when the
- * logical length exceeds proto-max-bulk-len: native bitmaps can address bit
- * offsets far beyond any representable string, so callers that need flat
- * bytes must handle oversized bitmaps explicitly. */
+ * logical length exceeds proto-max-bulk-len. */
 sds bitmapObjectMaterialize(const robj *o) {
     bitmapObject *bitmap = getBitmapObject(o);
     if (bitmap->byte_len > (uint64_t)server.proto_max_bulk_len) return NULL;
@@ -1140,8 +933,8 @@ static roaring64_bitmap_t *bitmapObjectExactlyOneBitopSources(bitmapBitopSource 
  * space and return the result as a new native bitmap object whose logical
  * length is 'maxlen', matching the string semantics where the destination
  * length equals the longest source. The operation never materializes flat
- * bytes, so it supports 64-bit logical lengths; the BITOP NOT length guard
- * lives at the command layer because complementing is inherently dense. */
+ * bytes; the BITOP NOT length guard lives at the command layer because
+ * complementing is inherently dense. */
 robj *bitmapObjectsBitopBitmap(bitmapBitop op, robj **objects, size_t numkeys,
                                uint64_t maxlen)
 {
@@ -1225,41 +1018,4 @@ robj *bitmapObjectsBitopBitmap(bitmapBitop op, robj **objects, size_t numkeys,
     robj *o = createObject(OBJ_BITMAP, bitmap);
     o->encoding = OBJ_ENCODING_BITMAP_ROARING;
     return o;
-}
-
-size_t bitmapObjectSerializedSize(const robj *o) {
-    bitmapObject *bitmap = getBitmapObject(o);
-    return roaring64_bitmap_portable_size_in_bytes(bitmap->roaring);
-}
-
-sds bitmapObjectSerialize(const robj *o) {
-    bitmapObject *bitmap = getBitmapObject(o);
-    size_t len = roaring64_bitmap_portable_size_in_bytes(bitmap->roaring);
-    sds payload = sdsnewlen(SDS_NOINIT, len);
-    size_t written = roaring64_bitmap_portable_serialize(bitmap->roaring, payload);
-    serverAssert(written == len);
-#if (BYTE_ORDER == BIG_ENDIAN)
-    serverAssert(bitmapPortableConvertEndian(payload, len, 0) == C_OK);
-#endif
-    return payload;
-}
-
-/* DEBUG BITMAP-ENDIAN-CHECK: the serialized payload is little-endian on every
- * host, so swapping it to the opposite endianness and back must parse cleanly
- * in both directions and reproduce the original bytes. Big-endian hosts start
- * from their already-converted payload, little-endian hosts start from the
- * native one, so the parser is exercised either way. */
-int bitmapObjectEndianRoundtripCheck(const robj *o) {
-    sds payload = bitmapObjectSerialize(o);
-    size_t len = sdslen(payload);
-    sds swapped = sdsnewlen(payload, len);
-    int first_from_le = (BYTE_ORDER == BIG_ENDIAN);
-
-    int ok = bitmapPortableConvertEndian(swapped, len, first_from_le) == C_OK &&
-             bitmapPortableConvertEndian(swapped, len, !first_from_le) == C_OK &&
-             memcmp(swapped, payload, len) == 0;
-
-    sdsfree(swapped);
-    sdsfree(payload);
-    return ok ? C_OK : C_ERR;
 }

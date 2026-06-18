@@ -779,13 +779,11 @@ void printBits(unsigned char *p, unsigned long count) {
 #define BITFIELDOP_SET 1
 #define BITFIELDOP_INCRBY 2
 
-/* This helper function used by GETBIT / SETBIT parses the bit offset argument
- * making sure an error is returned if it is negative or does not fit a signed
- * 64-bit integer. Bitmap commands accept 64-bit offsets: reads resolve any
- * offset on either representation (bits past the end of the value read as 0),
- * native bitmaps can address every parsed offset, and writes into legacy
- * string values enforce the proto-max-bulk-len bound at the point where the
- * target representation is known (see bitStringWriteOffsetWithinLimit()).
+/* This helper function used by bitmap commands parses the bit offset argument,
+ * making sure an error is returned if it is negative, does not fit a signed
+ * 64-bit integer, or addresses a byte at or beyond proto-max-bulk-len. Keeping
+ * the original public offset limit avoids command-surface differences between
+ * legacy string bitmaps and native compressed bitmaps.
  *
  * If the 'hash' argument is true, and 'bits is positive, then the command
  * will also parse bit offsets prefixed by "#". In such a case the offset
@@ -815,15 +813,22 @@ int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int
         loffset *= bits;
     }
 
+    if (!mustObeyClient(c) &&
+        (((uint64_t)loffset) >> 3) >= (uint64_t)server.proto_max_bulk_len)
+    {
+        addReplyError(c,err);
+        return C_ERR;
+    }
+
     *offset = loffset;
     return C_OK;
 }
 
-/* Legacy string bitmaps cannot address bits at or beyond proto-max-bulk-len
- * bytes (512MB by default). Returns 1 when 'maxbit' is writable in a string
- * value, otherwise replies with the legacy out-of-range error and returns 0.
- * Commands obeying a master or the AOF skip the check: the master already
- * validated the write against its own limit. */
+/* Bitmap writes cannot address bits at or beyond proto-max-bulk-len bytes
+ * (512MB by default). Returns 1 when 'maxbit' is writable, otherwise replies
+ * with the legacy out-of-range error and returns 0. Commands obeying a master
+ * or the AOF skip the check: the master already validated the write against
+ * its own limit. */
 static int bitStringWriteOffsetWithinLimit(client *c, uint64_t maxbit) {
     if (mustObeyClient(c) || (maxbit >> 3) < (uint64_t)server.proto_max_bulk_len)
         return 1;
@@ -1140,8 +1145,7 @@ void getbitCommand(client *c) {
     kvobj *kv = lookupKeyReadOrReply(c, c->argv[1], shared.czero);
     if (kv == NULL || checkStringOrBitmapType(c,kv)) return;
 
-    /* Reads accept 64-bit offsets on either representation: offsets past the
-     * end of the value read as 0, like any other unset bit. */
+    /* Offsets past the end of the value read as 0, like any other unset bit. */
     byte = bitoffset >> 3;
     bit = 7 - (bitoffset & 0x7);
     if (kv->type == OBJ_BITMAP) {
@@ -1572,6 +1576,21 @@ void bitopCommand(client *c) {
      * when bitmap-default-roaring is enabled on this server (a local decision,
      * propagated as the explicit result below). Otherwise it stays a string. */
     native_dest = has_native_bitmap || (maxlen && bitmapDefaultRoaringEnabled(c));
+
+    if (native_dest && !mustObeyClient(c) &&
+        maxlen > (uint64_t)server.proto_max_bulk_len)
+    {
+        unsigned long i;
+        for (i = 0; i < numkeys; i++) {
+            if (objects[i] && objects[i]->type == OBJ_STRING)
+                decrRefCount(objects[i]);
+        }
+        zfree(src);
+        zfree(len);
+        zfree(objects);
+        addReplyError(c, "string exceeds maximum allowed size (proto-max-bulk-len)");
+        return;
+    }
 
     /* BITOP NOT writes one result byte for every source byte, even when the
      * destination would be native. Keep the same safety limit as string
@@ -2308,6 +2327,10 @@ void bitfieldGeneric(client *c, int flags) {
 
             if (getBitfieldLastBit(bitoffset,bits,&last_bit) != C_OK) {
                 addReplyError(c,"bit offset is not an integer or out of range");
+                zfree(ops);
+                return;
+            }
+            if (!bitStringWriteOffsetWithinLimit(c,last_bit)) {
                 zfree(ops);
                 return;
             }
