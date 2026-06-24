@@ -107,6 +107,10 @@ jobs:
       - name: Build redis-roaring module
         run: |
           git -C redis-roaring submodule update --init --recursive deps/CRoaring deps/hiredis
+          (
+            cd redis-roaring/src
+            ../deps/CRoaring/amalgamation.sh
+          )
           cmake -S redis-roaring -B redis-roaring/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_ROARING_TESTS=OFF \
