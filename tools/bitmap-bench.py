@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -65,6 +65,8 @@ DATASET_KEYS = {
     "mixed_legacy_c": "bench:bitmap:mixed:legacy:c",
     "mixed_native_d": "bench:bitmap:mixed:native:d",
 }
+
+MODULE_RESULT_LABEL = "redis_roaring_module"
 
 
 class BenchError(RuntimeError):
@@ -206,6 +208,25 @@ def dense_payload(length: int) -> bytes:
 
 def mixed_payload(length: int, salt: int) -> bytes:
     return bytes(((i * 37 + salt) & 0xFF) for i in range(length))
+
+
+def iter_payload_set_bits(payload: bytes) -> Iterable[int]:
+    for byte_index, value in enumerate(payload):
+        base = byte_index * 8
+        for bit_index in range(8):
+            if value & (0x80 >> bit_index):
+                yield base + bit_index
+
+
+def chunked_ints(values: Iterable[int], chunk_size: int) -> Iterable[list[int]]:
+    chunk: list[int] = []
+    for value in values:
+        chunk.append(value)
+        if len(chunk) >= chunk_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
 
 
 @dataclass
@@ -427,6 +448,8 @@ class RedisBitmapBench:
             "--loglevel", "warning",
             "--daemonize", "no",
         ]
+        if self.args.mode == "module":
+            cmd.extend(["--loadmodule", self.require_module_path()])
         self.server_proc = subprocess.Popen(
             cmd,
             stdout=self.server_log,
@@ -522,6 +545,9 @@ class RedisBitmapBench:
             "runner_arch": os.environ.get("RUNNER_ARCH", platform.machine()),
             "github_sha": os.environ.get("GITHUB_SHA", ""),
             "source_sha": self.git_sha_for_src_dir(),
+            "module_path": str(Path(self.args.module_path).resolve()) if self.args.module_path else "",
+            "module_sha": self.git_sha_for_module(),
+            "module_command_prefix": self.args.module_command_prefix if self.args.mode == "module" else "",
             "redis_version": info.get("redis_version", ""),
             "redis_git_sha1": info.get("redis_git_sha1", ""),
             "redis_build_id": info.get("redis_build_id", ""),
@@ -529,8 +555,35 @@ class RedisBitmapBench:
             "redis_benchmark_version": self.binary_version(self.redis_benchmark),
         }
 
+    def require_module_path(self) -> str:
+        if not self.args.module_path:
+            raise BenchError("--module-path is required when --mode module starts redis-server")
+        path = Path(self.args.module_path)
+        if not path.exists():
+            raise BenchError(f"missing redis-roaring module library: {path}")
+        return str(path)
+
     def git_sha_for_src_dir(self) -> str:
         repo = self.src_dir.parent if self.src_dir.name == "src" else self.src_dir
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).strip()
+        except Exception:
+            return ""
+
+    def git_sha_for_module(self) -> str:
+        if self.args.mode != "module" and not self.args.module_path:
+            return ""
+        if self.args.module_sha:
+            return self.args.module_sha
+        if not self.args.module_path:
+            return ""
+        path = Path(self.args.module_path)
+        repo = path.parent if path.is_file() else path
         try:
             return subprocess.check_output(
                 ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -566,7 +619,17 @@ class RedisBitmapBench:
         if self.args.mode == "native":
             self.client.execute(["BITMAP", "CONVERT", key, "NATIVE"])
 
+    def module_cmd(self, name: str) -> str:
+        return f"{self.args.module_command_prefix}.{name}"
+
+    @staticmethod
+    def module_key(key: str) -> str:
+        return key if key.endswith(":module") else f"{key}:module"
+
     def prepare_data(self) -> None:
+        if self.args.mode == "module":
+            self.prepare_module_data()
+            return
         print("preparing bitmap datasets...", file=sys.stderr)
         self.dataset_keys = dict(DATASET_KEYS)
         self.realdata = self.load_realdata()
@@ -594,6 +657,64 @@ class RedisBitmapBench:
         self.convert_to_native(DATASET_KEYS["mixed_native_d"])
         self.prepare_realdata()
         self.set_default_roaring(False, required=False)
+
+    def prepare_module_data(self) -> None:
+        print("preparing redis-roaring module datasets...", file=sys.stderr)
+        self.dataset_keys = {name: self.module_key(key) for name, key in DATASET_KEYS.items()}
+        self.realdata = self.load_realdata()
+        self.client.execute(["FLUSHDB"])
+
+        dense = dense_payload(self.args.dense_bytes)
+        self.seed_module_bitmap_from_payload(self.dataset_keys["dense_legacy"], dense)
+        self.seed_module_bitmap_from_payload(self.dataset_keys["dense_native"], dense)
+
+        sparse_bits = self.sparse_bits()
+        clustered_bits = self.clustered_bits()
+        self.seed_module_bitmap(self.dataset_keys["sparse_legacy"], sparse_bits)
+        self.seed_module_bitmap(self.dataset_keys["sparse_native"], sparse_bits)
+        self.seed_module_bitmap(self.dataset_keys["clustered_legacy"], clustered_bits)
+        self.seed_module_bitmap(self.dataset_keys["clustered_native"], clustered_bits)
+
+        mixed_len = min(self.args.dense_bytes, self.args.mixed_bytes)
+        self.seed_module_bitmap_from_payload(
+            self.dataset_keys["mixed_legacy_a"],
+            mixed_payload(mixed_len, 11),
+        )
+        self.seed_module_bitmap_from_payload(
+            self.dataset_keys["mixed_native_b"],
+            mixed_payload(mixed_len, 37),
+        )
+        self.seed_module_bitmap_from_payload(
+            self.dataset_keys["mixed_legacy_c"],
+            mixed_payload(mixed_len, 71),
+        )
+        self.seed_module_bitmap_from_payload(
+            self.dataset_keys["mixed_native_d"],
+            mixed_payload(mixed_len, 109),
+        )
+        self.prepare_realdata()
+
+    def seed_module_bitmap_from_payload(self, key: str, payload: bytes) -> None:
+        self.seed_module_bitmap(key, iter_payload_set_bits(payload))
+
+    def seed_module_bitmap(self, key: str, bits: Iterable[int]) -> None:
+        self.client.execute(["DEL", key])
+
+        def commands() -> Iterable[list[Any]]:
+            first = True
+            for chunk in chunked_ints(bits, max(1, self.args.module_seed_chunk_size)):
+                if self.args.module_command_prefix == "R":
+                    max_offset = max(chunk)
+                    if max_offset > 0xFFFFFFFF:
+                        raise BenchError(
+                            "redis-roaring R.* mode only supports offsets up to UINT32_MAX; "
+                            "use --module-command-prefix R64 for larger datasets"
+                        )
+                command = "SETINTARRAY" if first else "APPENDINTARRAY"
+                first = False
+                yield [self.module_cmd(command), key, *chunk]
+
+        self.client.pipeline(commands(), chunk_size=16)
 
     def sparse_bits(self) -> list[int]:
         count = max(1, self.args.sparse_count)
@@ -688,20 +809,27 @@ class RedisBitmapBench:
         for item in self.realdata:
             legacy_key = f"bench:bitmap:real:{item.name}:legacy"
             native_key = f"bench:bitmap:real:{item.name}:native"
-            self.seed_setbit_bitmap(legacy_key, item.bits, native=False)
-            self.seed_setbit_bitmap(native_key, item.bits, native=True)
+            if self.args.mode == "module":
+                legacy_key = self.module_key(legacy_key)
+                native_key = self.module_key(native_key)
+                self.seed_module_bitmap(legacy_key, item.bits)
+                self.seed_module_bitmap(native_key, item.bits)
+            else:
+                self.seed_setbit_bitmap(legacy_key, item.bits, native=False)
+                self.seed_setbit_bitmap(native_key, item.bits, native=True)
             self.dataset_keys[f"real_{item.name}_legacy"] = legacy_key
             self.dataset_keys[f"real_{item.name}_native"] = native_key
 
     def dataset_summary(self) -> list[DatasetSummary]:
         summaries = []
         for name, key in self.dataset_keys.items():
+            bitcount_cmd = self.module_cmd("BITCOUNT") if self.args.mode == "module" else "BITCOUNT"
             summaries.append(DatasetSummary(
                 name=name,
                 key=key,
                 redis_type=decode_text(self.client.execute(["TYPE", key])),
                 encoding=decode_text(self.client.execute(["OBJECT", "ENCODING", key])),
-                bitcount=int(self.client.execute(["BITCOUNT", key])),
+                bitcount=int(self.client.execute([bitcount_cmd, key])),
                 memory_usage_bytes=self.memory_usage(key),
                 dump_payload_bytes=self.dump_payload_size(key),
             ))
@@ -709,17 +837,64 @@ class RedisBitmapBench:
 
     def selected_workloads(self) -> list[Workload]:
         workloads = self.workloads()
+        all_names = {w.name for w in workloads}
+        if self.args.mode == "module":
+            module_workloads = []
+            for workload in workloads:
+                translated = self.module_workload(workload)
+                if translated is not None:
+                    module_workloads.append(translated)
+            workloads = module_workloads
+        elif self.args.mode != "native":
+            workloads = [w for w in workloads if not w.native_only]
         if not self.args.only:
-            if self.args.mode != "native":
-                workloads = [w for w in workloads if not w.native_only]
             return workloads
         wanted = {name.strip() for name in self.args.only.split(",") if name.strip()}
-        unknown = wanted - {w.name for w in workloads}
+        unknown = wanted - all_names
         if unknown:
             raise BenchError(f"unknown workload(s): {', '.join(sorted(unknown))}")
-        if self.args.mode != "native":
-            workloads = [w for w in workloads if not w.native_only]
+        unsupported = wanted - {w.name for w in workloads}
+        if unsupported:
+            raise BenchError(
+                f"workload(s) not supported in {self.args.mode} mode: "
+                f"{', '.join(sorted(unsupported))}"
+            )
         return [w for w in workloads if w.name in wanted]
+
+    def module_workload(self, workload: Workload) -> Optional[Workload]:
+        if workload.native_only:
+            return None
+        command = self.module_command_for(workload.command)
+        if command is None:
+            return None
+        sample_key = self.module_key(workload.sample_key) if workload.sample_key else None
+        return replace(workload, command=command, sample_key=sample_key)
+
+    def module_command_for(self, command: list[str]) -> Optional[list[str]]:
+        if not command:
+            return None
+        name = command[0].upper()
+        if name in ("SETBIT", "GETBIT"):
+            return [self.module_cmd(name), self.module_key(command[1]), *command[2:]]
+        if name == "BITCOUNT":
+            if len(command) != 2:
+                return None
+            return [self.module_cmd("BITCOUNT"), self.module_key(command[1])]
+        if name == "BITPOS":
+            if len(command) != 3:
+                return None
+            return [self.module_cmd("BITPOS"), self.module_key(command[1]), command[2]]
+        if name == "BITOP":
+            operation = command[1].upper()
+            if operation not in ("AND", "OR", "XOR", "NOT", "DIFF", "DIFF1", "ANDOR", "ONE"):
+                return None
+            return [
+                self.module_cmd("BITOP"),
+                operation,
+                self.module_key(command[2]),
+                *(self.module_key(key) for key in command[3:]),
+            ]
+        return None
 
     def workloads(self) -> list[Workload]:
         sparse_hit_offset = str(self.sparse_bits()[-1])
@@ -898,6 +1073,9 @@ class RedisBitmapBench:
         return workloads
 
     def setup_setbit_native_create(self) -> None:
+        if self.args.mode == "module":
+            self.client.execute(["DEL", self.module_key("bench:bitmap:setbit:create")])
+            return
         self.set_default_roaring(self.args.mode == "native", required=self.args.mode == "native")
         self.client.execute(["DEL", "bench:bitmap:setbit:create"])
 
@@ -914,15 +1092,19 @@ class RedisBitmapBench:
         self.convert_to_native("bench:bitmap:bitfield:write")
 
     def setup_bitop_mixed(self) -> None:
+        keys = [
+            "bench:bitmap:bitop:and:dest",
+            "bench:bitmap:bitop:or:dest",
+            "bench:bitmap:bitop:xor:dest",
+            "bench:bitmap:bitop:not:dest",
+            "bench:bitmap:bitop:diff1:dest",
+            "bench:bitmap:bitop:one:dest",
+            "bench:bitmap:real:and:dest",
+        ]
+        if self.args.mode == "module":
+            keys = [self.module_key(key) for key in keys]
         self.set_default_roaring(False, required=False)
-        self.client.execute(["DEL",
-                             "bench:bitmap:bitop:and:dest",
-                             "bench:bitmap:bitop:or:dest",
-                             "bench:bitmap:bitop:xor:dest",
-                             "bench:bitmap:bitop:not:dest",
-                             "bench:bitmap:bitop:diff1:dest",
-                             "bench:bitmap:bitop:one:dest",
-                             "bench:bitmap:real:and:dest"])
+        self.client.execute(["DEL", *keys])
 
     def run_workload(self, workload: Workload) -> Result:
         samples = [
@@ -1090,7 +1272,7 @@ class RedisBitmapBench:
         self.prepare_data()
         for name in ("dense_legacy", "dense_native", "sparse_native", "clustered_native",
                      "mixed_legacy_a", "mixed_native_b"):
-            self.persistence_results.append(self.run_dump_restore(name, DATASET_KEYS[name]))
+            self.persistence_results.append(self.run_dump_restore(name, self.dataset_keys[name]))
 
         self.prepare_data()
         self.persistence_results.append(self.run_rdb_save_load())
@@ -1118,6 +1300,8 @@ class RedisBitmapBench:
             "restored_type": decode_text(self.client.execute(["TYPE", dest])),
             "restored_encoding": decode_text(self.client.execute(["OBJECT", "ENCODING", dest])),
         }
+        if self.args.mode == "module":
+            extra["payload_format"] = "redis-roaring-module"
         stall = canary.stats()
         if stall is not None:
             extra["stall"] = asdict(stall)
@@ -1150,6 +1334,8 @@ class RedisBitmapBench:
             "load_ms": load_elapsed,
             "dbsize_after_load": int(self.client.execute(["DBSIZE"])),
         }
+        if self.args.mode == "module":
+            extra["payload_format"] = "redis-roaring-module"
         stall = canary.stats()
         if stall is not None:
             extra["stall"] = asdict(stall)
@@ -1183,6 +1369,8 @@ class RedisBitmapBench:
             "aof_last_bgrewrite_status": persistence.get("aof_last_bgrewrite_status"),
             "aof_current_size": aof_current_size,
         }
+        if self.args.mode == "module":
+            extra["payload_format"] = "redis-roaring-module"
         stall = canary.stats()
         if stall is not None:
             extra["stall"] = asdict(stall)
@@ -1345,6 +1533,8 @@ class RedisBitmapBench:
             notes.append(f"runs={result.extra['runs']}")
         if result.category == "persistence":
             notes.extend(f"{k}={v}" for k, v in result.extra.items() if k.endswith("_ms") or k.endswith("_status"))
+        if result.extra.get("payload_format"):
+            notes.append(f"payload_format={result.extra['payload_format']}")
         return {
             "mode": self.args.mode_label,
             "category": result.category,
@@ -1438,10 +1628,19 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--src-dir", help="Path to src containing redis-server, redis-cli, and redis-benchmark")
-    parser.add_argument("--mode", choices=("native", "legacy"), default="native",
-                        help="native uses bitmap-default-roaring/convert; legacy uses string bitmap data only")
+    parser.add_argument("--mode", choices=("native", "legacy", "module"), default="native",
+                        help=("native uses bitmap-default-roaring/convert; legacy uses string bitmap data only; "
+                              "module uses redis-roaring R.* commands"))
     parser.add_argument("--mode-label", default="redis-pr-native",
                         help="Label written to JSON/CSV/Markdown output")
+    parser.add_argument("--module-path",
+                        help="Path to libredis-roaring.so for --mode module server launches")
+    parser.add_argument("--module-sha",
+                        help="Resolved redis-roaring commit SHA to record in JSON/Markdown metadata")
+    parser.add_argument("--module-command-prefix", choices=("R", "R64"), default="R",
+                        help="redis-roaring command family to use for module mode")
+    parser.add_argument("--module-seed-chunk-size", type=int, default=4096,
+                        help="Integer count per redis-roaring SETINTARRAY/APPENDINTARRAY seeding command")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=6396)
     parser.add_argument("--db", type=int, default=9)
@@ -1500,6 +1699,10 @@ def parse_args() -> argparse.Namespace:
                         help="Run a native-mode candidate from this src directory")
     parser.add_argument("--compare-legacy-src-dir",
                         help="Optional PR legacy guardrail src directory")
+    parser.add_argument("--compare-module-src-dir",
+                        help="Optional Redis host src directory for redis-roaring module compare mode")
+    parser.add_argument("--compare-module-path",
+                        help="Optional libredis-roaring.so path for redis-roaring module compare mode")
     parser.add_argument("--compare-out",
                         help="Write combined compare JSON and Markdown using this path prefix")
     parser.add_argument("--socket-timeout", type=float, default=30.0)
@@ -1522,25 +1725,58 @@ def run_compare(args: argparse.Namespace) -> int:
         csv_path = prefix.with_suffix(".csv")
     json_path.parent.mkdir(parents=True, exist_ok=True)
 
-    runs = [
-        ("redis_before", "legacy", args.compare_before_src_dir, args.port),
-        ("redis_pr_native", "native", args.compare_after_src_dir, args.port + 1),
+    runs: list[dict[str, Any]] = [
+        {
+            "label": "redis_before",
+            "mode": "legacy",
+            "src_dir": args.compare_before_src_dir,
+            "port": args.port,
+            "module_path": None,
+        },
+        {
+            "label": "redis_pr_native",
+            "mode": "native",
+            "src_dir": args.compare_after_src_dir,
+            "port": args.port + 1,
+            "module_path": None,
+        },
     ]
+    if args.compare_module_src_dir or args.compare_module_path:
+        if not args.compare_module_src_dir or not args.compare_module_path:
+            raise BenchError("--compare-module-src-dir and --compare-module-path must be provided together")
+        runs.append({
+            "label": MODULE_RESULT_LABEL,
+            "mode": "module",
+            "src_dir": args.compare_module_src_dir,
+            "port": args.port + 2,
+            "module_path": args.compare_module_path,
+        })
     if args.compare_legacy_src_dir:
-        runs.append(("redis_pr_legacy", "legacy", args.compare_legacy_src_dir, args.port + 2))
+        runs.append({
+            "label": "redis_pr_legacy",
+            "mode": "legacy",
+            "src_dir": args.compare_legacy_src_dir,
+            "port": args.port + 2 + (1 if args.compare_module_src_dir else 0),
+            "module_path": None,
+        })
 
     payloads = []
     with tempfile.TemporaryDirectory(prefix="bitmap-bench-compare-") as tmp:
-        for label, mode, src_dir, port in runs:
+        for run in runs:
+            label = run["label"]
+            mode = run["mode"]
             print(f"\n=== compare run: {label} ({mode}) ===", file=sys.stderr)
             run_args = argparse.Namespace(**vars(args))
-            run_args.src_dir = src_dir
+            run_args.src_dir = run["src_dir"]
             run_args.mode = mode
             run_args.mode_label = label
-            run_args.port = port
+            run_args.port = run["port"]
+            run_args.module_path = run["module_path"]
             run_args.compare_before_src_dir = None
             run_args.compare_after_src_dir = None
             run_args.compare_legacy_src_dir = None
+            run_args.compare_module_src_dir = None
+            run_args.compare_module_path = None
             run_args.compare_out = None
             run_args.json_out = str(Path(tmp) / f"{label}.json")
             run_args.csv_out = None
@@ -1554,6 +1790,7 @@ def run_compare(args: argparse.Namespace) -> int:
     comparison = compare_payloads(payloads)
     combined = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "labels": [payload.get("mode_label", payload.get("mode", "run")) for payload in payloads],
         "runs": payloads,
         "comparison": comparison,
     }
@@ -1569,6 +1806,7 @@ def run_compare(args: argparse.Namespace) -> int:
 
 def compare_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_name: dict[str, dict[str, dict[str, Any]]] = {}
+    all_labels = [payload.get("mode_label", payload.get("mode", "run")) for payload in payloads]
     for payload in payloads:
         label = payload.get("mode_label", payload.get("mode", "run"))
         for result in payload.get("results", []) + payload.get("persistence", []):
@@ -1577,28 +1815,32 @@ def compare_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for name in sorted(by_name):
         row: dict[str, Any] = {"workload": name}
-        labels = sorted(by_name[name])
-        first = by_name[name][labels[0]]
+        first = next(iter(by_name[name].values()))
         row["category"] = first.get("category", "")
         row["story"] = first.get("extra", {}).get("story", row["category"])
         row["dataset"] = first.get("extra", {}).get("dataset", "-")
         row["metric"] = "qps" if first.get("qps") is not None else "elapsed_ms"
         row["metric_direction"] = "higher_is_better" if row["metric"] == "qps" else "lower_is_better"
-        for label in labels:
-            result = by_name[name][label]
-            value = result.get("qps")
-            if value is None:
-                value = result.get("elapsed_ms")
-            row[label] = value
-        if "redis_before" in row and "redis_pr_native" in row and row["redis_before"]:
-            if row["metric"] == "elapsed_ms":
-                row["native_delta_percent"] = ((row["redis_before"] - row["redis_pr_native"]) /
-                                               row["redis_before"] * 100.0)
-            else:
-                row["native_delta_percent"] = ((row["redis_pr_native"] - row["redis_before"]) /
-                                               row["redis_before"] * 100.0)
-        else:
-            row["native_delta_percent"] = None
+        for label in all_labels:
+            result = by_name[name].get(label)
+            row[label] = compare_result_value(result) if result else missing_compare_value(label)
+        row["core_vs_string_percent"] = metric_delta_percent(
+            row.get("redis_pr_native"),
+            row.get("redis_before"),
+            row["metric"],
+        )
+        row["native_delta_percent"] = row["core_vs_string_percent"]
+        row["core_vs_module_percent"] = metric_delta_percent(
+            row.get("redis_pr_native"),
+            row.get(MODULE_RESULT_LABEL),
+            row["metric"],
+        )
+        notes = []
+        if row.get(MODULE_RESULT_LABEL) == "N/A":
+            notes.append("No redis-roaring equivalent")
+        if row["category"] == "persistence":
+            notes.append("Payload formats are implementation-specific")
+        row["notes"] = "; ".join(notes) if notes else "-"
         rows.append(row)
     return rows
 
@@ -1607,29 +1849,31 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
     lines = [
         "# Redis Native Bitmap Benchmark Compare",
         "",
-        "| Run | Mode | Redis | Source SHA | Runner |",
-        "| --- | --- | --- | --- | --- |",
+        "| Run | Mode | Redis | Source SHA | Module SHA | Runner |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for payload in payloads:
         env = payload.get("environment", {})
         lines.append(
             f"| {payload.get('mode_label', '-')} | {payload.get('mode', '-')} | "
             f"{env.get('redis_version', '-')} | {env.get('source_sha', '-')} | "
+            f"{env.get('module_sha', '-') or '-'} | "
             f"{env.get('runner_name', 'local')} |"
         )
     lines.extend([
         "",
-        "Native delta is metric-aware: positive means higher QPS for throughput rows and lower elapsed_ms for latency rows.",
+        "Delta columns are metric-aware: positive means higher QPS for throughput rows and lower elapsed_ms for latency, payload, memory, and persistence rows.",
         "",
-        "| Story | Dataset | Workload | Metric | Redis before | Redis PR native | Native delta % (positive=better) | PR legacy |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "| Story | Dataset | Workload | Metric | Redis string | Redis core Roaring | redis-roaring module | Core vs string | Core vs module | Notes |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ])
     for row in rows:
         lines.append(
             f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row['workload']} | "
             f"{row.get('metric', '-')} | {fmt_any(row.get('redis_before'))} | "
-            f"{fmt_any(row.get('redis_pr_native'))} | {fmt_delta(row.get('native_delta_percent'))} | "
-            f"{fmt_any(row.get('redis_pr_legacy'))} |"
+            f"{fmt_any(row.get('redis_pr_native'))} | {fmt_any(row.get(MODULE_RESULT_LABEL))} | "
+            f"{fmt_delta(row.get('core_vs_string_percent'))} | "
+            f"{fmt_delta(row.get('core_vs_module_percent'))} | {row.get('notes', '-')} |"
         )
     return lines
 
@@ -1644,14 +1888,41 @@ def write_compare_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "metric_direction",
         "redis_before",
         "redis_pr_native",
+        MODULE_RESULT_LABEL,
+        "core_vs_string_percent",
+        "core_vs_module_percent",
         "native_delta_percent",
         "redis_pr_legacy",
+        "notes",
     ]
     with open(path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def compare_result_value(result: Optional[dict[str, Any]]) -> Any:
+    if not result:
+        return None
+    value = result.get("qps")
+    if value is None:
+        value = result.get("elapsed_ms")
+    return value
+
+
+def missing_compare_value(label: str) -> Any:
+    return "N/A" if label == MODULE_RESULT_LABEL else None
+
+
+def metric_delta_percent(candidate: Any, baseline: Any, metric: str) -> Optional[float]:
+    if not isinstance(candidate, (int, float)) or not isinstance(baseline, (int, float)):
+        return None
+    if baseline == 0:
+        return None
+    if metric == "elapsed_ms":
+        return (baseline - candidate) / baseline * 100.0
+    return (candidate - baseline) / baseline * 100.0
 
 
 def fmt_any(value: Any) -> str:

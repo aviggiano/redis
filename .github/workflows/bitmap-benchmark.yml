@@ -6,12 +6,18 @@ on:
       runner_label:
         description: "Linux x64 runner label to use; choose the largest configured runner for publishable numbers"
         default: "ubuntu-latest"
-      before_ref:
+      baseline_redis_ref:
         description: "Baseline Redis commit SHA/ref to build in legacy mode; use a full SHA for publishable numbers"
         default: "unstable"
-      after_ref:
+      core_redis_ref:
         description: "Candidate Redis commit SHA/ref to build in native and legacy guardrail modes; empty means the workflow SHA"
         default: ""
+      module_host_redis_ref:
+        description: "redis/redis host commit SHA/ref used to load redis-roaring; use a full SHA for publishable numbers"
+        default: "unstable"
+      redis_roaring_ref:
+        description: "aviggiano/redis-roaring commit SHA/ref to build as the module; use a full SHA for publishable numbers"
+        default: "master"
       request_scale:
         description: "Multiplier for command benchmark request counts"
         default: "1.0"
@@ -40,31 +46,51 @@ jobs:
     steps:
       - name: Resolve requested refs
         run: |
-          after_ref="${{ inputs.after_ref }}"
-          if [ -z "$after_ref" ]; then
-            after_ref="${{ github.sha }}"
+          core_ref="${{ inputs.core_redis_ref }}"
+          if [ -z "$core_ref" ]; then
+            core_ref="${{ github.sha }}"
           fi
-          echo "AFTER_REF=$after_ref" >> "$GITHUB_ENV"
-          echo "BEFORE_REF=${{ inputs.before_ref }}" >> "$GITHUB_ENV"
+          echo "CORE_REDIS_REF=$core_ref" >> "$GITHUB_ENV"
+          echo "BASELINE_REDIS_REF=${{ inputs.baseline_redis_ref }}" >> "$GITHUB_ENV"
+          echo "MODULE_HOST_REDIS_REF=${{ inputs.module_host_redis_ref }}" >> "$GITHUB_ENV"
+          echo "REDIS_ROARING_REF=${{ inputs.redis_roaring_ref }}" >> "$GITHUB_ENV"
 
       - name: Checkout baseline
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.before_ref }}
+          ref: ${{ inputs.baseline_redis_ref }}
           path: before
 
       - name: Checkout candidate
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.after_ref || github.sha }}
+          ref: ${{ inputs.core_redis_ref || github.sha }}
           path: after
+
+      - name: Checkout module host Redis
+        uses: actions/checkout@v6
+        with:
+          repository: redis/redis
+          ref: ${{ inputs.module_host_redis_ref }}
+          path: module-host
+
+      - name: Checkout redis-roaring
+        uses: actions/checkout@v6
+        with:
+          repository: aviggiano/redis-roaring
+          ref: ${{ inputs.redis_roaring_ref }}
+          path: redis-roaring
 
       - name: Record checked-out SHAs
         run: |
           before_sha="$(git -C before rev-parse HEAD)"
           after_sha="$(git -C after rev-parse HEAD)"
+          module_host_sha="$(git -C module-host rev-parse HEAD)"
+          redis_roaring_sha="$(git -C redis-roaring rev-parse HEAD)"
           echo "BEFORE_SHA=$before_sha" >> "$GITHUB_ENV"
           echo "AFTER_SHA=$after_sha" >> "$GITHUB_ENV"
+          echo "MODULE_HOST_SHA=$module_host_sha" >> "$GITHUB_ENV"
+          echo "REDIS_ROARING_SHA=$redis_roaring_sha" >> "$GITHUB_ENV"
 
       - name: Build baseline
         working-directory: before
@@ -74,16 +100,37 @@ jobs:
         working-directory: after
         run: make -j"$(nproc)" REDIS_CFLAGS='-Werror'
 
+      - name: Build module host Redis
+        working-directory: module-host
+        run: make -j"$(nproc)" REDIS_CFLAGS='-Werror'
+
+      - name: Build redis-roaring module
+        run: |
+          git -C redis-roaring submodule update --init --recursive deps/CRoaring deps/hiredis
+          cmake -S redis-roaring -B redis-roaring/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_ROARING_TESTS=OFF \
+            -DDISABLE_TESTS=ON
+          cmake --build redis-roaring/build --target redis-roaring --parallel "$(nproc)"
+          module_path="$(find "$GITHUB_WORKSPACE/redis-roaring/build" -type f -name 'libredis-roaring*.so' | head -n 1)"
+          test -n "$module_path"
+          echo "REDIS_ROARING_MODULE=$module_path" >> "$GITHUB_ENV"
+
       - name: Prepare benchmark directories
         run: |
           mkdir -p "$RUNNER_TEMP/croaring-realdata"
           mkdir -p "$GITHUB_WORKSPACE/bitmap-bench-results"
           {
             echo "runner_label=${{ inputs.runner_label }}"
-            echo "before_ref_input=$BEFORE_REF"
+            echo "baseline_redis_ref_input=$BASELINE_REDIS_REF"
             echo "before_sha=$BEFORE_SHA"
-            echo "after_ref_input=$AFTER_REF"
+            echo "core_redis_ref_input=$CORE_REDIS_REF"
             echo "after_sha=$AFTER_SHA"
+            echo "module_host_redis_ref_input=$MODULE_HOST_REDIS_REF"
+            echo "module_host_sha=$MODULE_HOST_SHA"
+            echo "redis_roaring_ref_input=$REDIS_ROARING_REF"
+            echo "redis_roaring_sha=$REDIS_ROARING_SHA"
+            echo "redis_roaring_module=$REDIS_ROARING_MODULE"
             uname -a
             lscpu || true
             free -h || true
@@ -95,8 +142,11 @@ jobs:
           python3 tools/bitmap-bench.py \
             --compare-before-src-dir "$GITHUB_WORKSPACE/before/src" \
             --compare-after-src-dir "$GITHUB_WORKSPACE/after/src" \
+            --compare-module-src-dir "$GITHUB_WORKSPACE/module-host/src" \
+            --compare-module-path "$REDIS_ROARING_MODULE" \
             --compare-legacy-src-dir "$GITHUB_WORKSPACE/after/src" \
             --compare-out "$GITHUB_WORKSPACE/bitmap-bench-results/bitmap-bench-compare" \
+            --module-sha "$REDIS_ROARING_SHA" \
             --request-scale "${{ inputs.request_scale }}" \
             --runs "${{ inputs.runs }}" \
             --ping-canary \
