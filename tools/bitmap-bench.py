@@ -37,6 +37,7 @@ REALDATA_ARCHIVES = (
 )
 CSV_FIELDS = [
     "mode",
+    "target_groups",
     "category",
     "story",
     "dataset",
@@ -44,6 +45,13 @@ CSV_FIELDS = [
     "metric",
     "value",
     "elapsed_ms",
+    "time_per_op_us",
+    "time_per_op_mean_us",
+    "time_per_op_median_us",
+    "time_per_op_min_us",
+    "time_per_op_max_us",
+    "time_per_op_stdev_us",
+    "time_per_op_cv_percent",
     "qps",
     "memory_bytes",
     "peak_bytes",
@@ -67,6 +75,23 @@ DATASET_KEYS = {
 }
 
 MODULE_RESULT_LABEL = "redis_roaring_module"
+COMPARE_LABELS = (
+    "redis_before",
+    "redis_pr_native",
+    MODULE_RESULT_LABEL,
+)
+PROFILE_GROUPS = {
+    "full": ("small-sets", "bitsets", "mixed-bitop"),
+    "small-sets": ("small-sets",),
+    "bitsets": ("bitsets",),
+    "mixed-bitop": ("mixed-bitop",),
+}
+SMOKE_WORKLOADS = {
+    "setbit_native_create_sparse",
+    "getbit_sparse_native_hit",
+    "bitcount_dense_native",
+    "bitop_and_mixed",
+}
 
 
 class BenchError(RuntimeError):
@@ -229,6 +254,54 @@ def chunked_ints(values: Iterable[int], chunk_size: int) -> Iterable[list[int]]:
         yield chunk
 
 
+def dataset_metrics_from_bits(bits: Iterable[int], logical_bits: Optional[int] = None) -> dict[str, Any]:
+    values = list(bits)
+    max_offset = max(values) if values else None
+    if logical_bits is None:
+        logical_bits = (max_offset + 1) if max_offset is not None else 0
+    logical_bytes = (logical_bits + 7) // 8 if logical_bits else 0
+    density = (len(values) / logical_bits) if logical_bits else 0.0
+    return {
+        "max_offset": max_offset,
+        "logical_bytes": logical_bytes,
+        "density": density,
+    }
+
+
+def dataset_metrics_from_payload(payload: bytes) -> dict[str, Any]:
+    return dataset_metrics_from_bits(iter_payload_set_bits(payload), len(payload) * 8)
+
+
+def time_per_op_us(elapsed_ms_value: float, requests: Optional[int], qps: Optional[float]) -> Optional[float]:
+    if qps is not None and qps > 0:
+        return 1_000_000.0 / qps
+    if requests and requests > 0:
+        return elapsed_ms_value * 1000.0 / requests
+    return None
+
+
+def sample_stats(values: list[float]) -> dict[str, Optional[float]]:
+    if not values:
+        return {
+            "mean": None,
+            "median": None,
+            "min": None,
+            "max": None,
+            "stdev": None,
+            "cv_percent": None,
+        }
+    mean = statistics.mean(values)
+    stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+    return {
+        "mean": mean,
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+        "stdev": stdev,
+        "cv_percent": (stdev / mean * 100.0) if mean else None,
+    }
+
+
 @dataclass
 class Workload:
     name: str
@@ -244,6 +317,7 @@ class Workload:
     one_shot: bool = False
     story: Optional[str] = None
     dataset: Optional[str] = None
+    target_groups: tuple[str, ...] = ("bitsets",)
     native_only: bool = False
     stall_probe: bool = False
 
@@ -257,6 +331,9 @@ class DatasetSummary:
     bitcount: int
     memory_usage_bytes: Optional[int]
     dump_payload_bytes: Optional[int]
+    max_offset: Optional[int] = None
+    logical_bytes: Optional[int] = None
+    density: Optional[float] = None
 
 
 @dataclass
@@ -276,6 +353,7 @@ class Result:
     pipeline: Optional[int] = None
     rand_range: Optional[int] = None
     command: Optional[list[str]] = None
+    time_per_op_us: Optional[float] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -366,6 +444,7 @@ class RedisBitmapBench:
         self.server_log_path: Optional[Path] = None
         self.datasets: list[DatasetSummary] = []
         self.dataset_keys: dict[str, str] = dict(DATASET_KEYS)
+        self.dataset_metadata: dict[str, dict[str, Any]] = {}
         self.realdata: list[RealDataSet] = []
         self.results: list[Result] = []
         self.persistence_results: list[Result] = []
@@ -394,7 +473,12 @@ class RedisBitmapBench:
                 result = self.run_workload(workload)
                 self.results.append(result)
                 payload = "-" if result.payload_size_bytes is None else str(result.payload_size_bytes)
-                metric = f"{result.qps:.2f} req/s" if result.qps is not None else "one-shot"
+                if result.time_per_op_us is not None:
+                    metric = f"{result.time_per_op_us:.2f} us/op"
+                elif result.qps is not None:
+                    metric = f"{result.qps:.2f} req/s"
+                else:
+                    metric = "measured"
                 print(
                     f"{result.name:32s} {metric:>18s} "
                     f"{result.elapsed_ms:9.2f} ms payload={payload}"
@@ -632,6 +716,7 @@ class RedisBitmapBench:
             return
         print("preparing bitmap datasets...", file=sys.stderr)
         self.dataset_keys = dict(DATASET_KEYS)
+        self.dataset_metadata = {}
         self.realdata = self.load_realdata()
         self.client.execute(["FLUSHDB"])
         self.set_default_roaring(False, required=False)
@@ -640,6 +725,8 @@ class RedisBitmapBench:
         self.client.execute(["SET", DATASET_KEYS["dense_legacy"], dense])
         self.client.execute(["SET", DATASET_KEYS["dense_native"], dense])
         self.convert_to_native(DATASET_KEYS["dense_native"])
+        self.record_dataset_metadata(DATASET_KEYS["dense_legacy"], dataset_metrics_from_payload(dense))
+        self.record_dataset_metadata(DATASET_KEYS["dense_native"], dataset_metrics_from_payload(dense))
 
         sparse_bits = self.sparse_bits()
         clustered_bits = self.clustered_bits()
@@ -647,26 +734,43 @@ class RedisBitmapBench:
         self.seed_setbit_bitmap(DATASET_KEYS["sparse_native"], sparse_bits, native=True)
         self.seed_setbit_bitmap(DATASET_KEYS["clustered_legacy"], clustered_bits, native=False)
         self.seed_setbit_bitmap(DATASET_KEYS["clustered_native"], clustered_bits, native=True)
+        sparse_metrics = dataset_metrics_from_bits(sparse_bits, self.args.sparse_space)
+        clustered_metrics = dataset_metrics_from_bits(clustered_bits)
+        self.record_dataset_metadata(DATASET_KEYS["sparse_legacy"], sparse_metrics)
+        self.record_dataset_metadata(DATASET_KEYS["sparse_native"], sparse_metrics)
+        self.record_dataset_metadata(DATASET_KEYS["clustered_legacy"], clustered_metrics)
+        self.record_dataset_metadata(DATASET_KEYS["clustered_native"], clustered_metrics)
 
         mixed_len = min(self.args.dense_bytes, self.args.mixed_bytes)
-        self.client.execute(["SET", DATASET_KEYS["mixed_legacy_a"], mixed_payload(mixed_len, 11)])
-        self.client.execute(["SET", DATASET_KEYS["mixed_native_b"], mixed_payload(mixed_len, 37)])
+        mixed_a = mixed_payload(mixed_len, 11)
+        mixed_b = mixed_payload(mixed_len, 37)
+        mixed_c = mixed_payload(mixed_len, 71)
+        mixed_d = mixed_payload(mixed_len, 109)
+        self.client.execute(["SET", DATASET_KEYS["mixed_legacy_a"], mixed_a])
+        self.client.execute(["SET", DATASET_KEYS["mixed_native_b"], mixed_b])
         self.convert_to_native(DATASET_KEYS["mixed_native_b"])
-        self.client.execute(["SET", DATASET_KEYS["mixed_legacy_c"], mixed_payload(mixed_len, 71)])
-        self.client.execute(["SET", DATASET_KEYS["mixed_native_d"], mixed_payload(mixed_len, 109)])
+        self.client.execute(["SET", DATASET_KEYS["mixed_legacy_c"], mixed_c])
+        self.client.execute(["SET", DATASET_KEYS["mixed_native_d"], mixed_d])
         self.convert_to_native(DATASET_KEYS["mixed_native_d"])
+        self.record_dataset_metadata(DATASET_KEYS["mixed_legacy_a"], dataset_metrics_from_payload(mixed_a))
+        self.record_dataset_metadata(DATASET_KEYS["mixed_native_b"], dataset_metrics_from_payload(mixed_b))
+        self.record_dataset_metadata(DATASET_KEYS["mixed_legacy_c"], dataset_metrics_from_payload(mixed_c))
+        self.record_dataset_metadata(DATASET_KEYS["mixed_native_d"], dataset_metrics_from_payload(mixed_d))
         self.prepare_realdata()
         self.set_default_roaring(False, required=False)
 
     def prepare_module_data(self) -> None:
         print("preparing redis-roaring module datasets...", file=sys.stderr)
         self.dataset_keys = {name: self.module_key(key) for name, key in DATASET_KEYS.items()}
+        self.dataset_metadata = {}
         self.realdata = self.load_realdata()
         self.client.execute(["FLUSHDB"])
 
         dense = dense_payload(self.args.dense_bytes)
         self.seed_module_bitmap_from_payload(self.dataset_keys["dense_legacy"], dense)
         self.seed_module_bitmap_from_payload(self.dataset_keys["dense_native"], dense)
+        self.record_dataset_metadata(self.dataset_keys["dense_legacy"], dataset_metrics_from_payload(dense))
+        self.record_dataset_metadata(self.dataset_keys["dense_native"], dataset_metrics_from_payload(dense))
 
         sparse_bits = self.sparse_bits()
         clustered_bits = self.clustered_bits()
@@ -674,25 +778,42 @@ class RedisBitmapBench:
         self.seed_module_bitmap(self.dataset_keys["sparse_native"], sparse_bits)
         self.seed_module_bitmap(self.dataset_keys["clustered_legacy"], clustered_bits)
         self.seed_module_bitmap(self.dataset_keys["clustered_native"], clustered_bits)
+        sparse_metrics = dataset_metrics_from_bits(sparse_bits, self.args.sparse_space)
+        clustered_metrics = dataset_metrics_from_bits(clustered_bits)
+        self.record_dataset_metadata(self.dataset_keys["sparse_legacy"], sparse_metrics)
+        self.record_dataset_metadata(self.dataset_keys["sparse_native"], sparse_metrics)
+        self.record_dataset_metadata(self.dataset_keys["clustered_legacy"], clustered_metrics)
+        self.record_dataset_metadata(self.dataset_keys["clustered_native"], clustered_metrics)
 
         mixed_len = min(self.args.dense_bytes, self.args.mixed_bytes)
+        mixed_a = mixed_payload(mixed_len, 11)
+        mixed_b = mixed_payload(mixed_len, 37)
+        mixed_c = mixed_payload(mixed_len, 71)
+        mixed_d = mixed_payload(mixed_len, 109)
         self.seed_module_bitmap_from_payload(
             self.dataset_keys["mixed_legacy_a"],
-            mixed_payload(mixed_len, 11),
+            mixed_a,
         )
         self.seed_module_bitmap_from_payload(
             self.dataset_keys["mixed_native_b"],
-            mixed_payload(mixed_len, 37),
+            mixed_b,
         )
         self.seed_module_bitmap_from_payload(
             self.dataset_keys["mixed_legacy_c"],
-            mixed_payload(mixed_len, 71),
+            mixed_c,
         )
         self.seed_module_bitmap_from_payload(
             self.dataset_keys["mixed_native_d"],
-            mixed_payload(mixed_len, 109),
+            mixed_d,
         )
+        self.record_dataset_metadata(self.dataset_keys["mixed_legacy_a"], dataset_metrics_from_payload(mixed_a))
+        self.record_dataset_metadata(self.dataset_keys["mixed_native_b"], dataset_metrics_from_payload(mixed_b))
+        self.record_dataset_metadata(self.dataset_keys["mixed_legacy_c"], dataset_metrics_from_payload(mixed_c))
+        self.record_dataset_metadata(self.dataset_keys["mixed_native_d"], dataset_metrics_from_payload(mixed_d))
         self.prepare_realdata()
+
+    def record_dataset_metadata(self, key: str, metrics: dict[str, Any]) -> None:
+        self.dataset_metadata[key] = metrics
 
     def seed_module_bitmap_from_payload(self, key: str, payload: bytes) -> None:
         self.seed_module_bitmap(key, iter_payload_set_bits(payload))
@@ -819,11 +940,15 @@ class RedisBitmapBench:
                 self.seed_setbit_bitmap(native_key, item.bits, native=True)
             self.dataset_keys[f"real_{item.name}_legacy"] = legacy_key
             self.dataset_keys[f"real_{item.name}_native"] = native_key
+            metrics = dataset_metrics_from_bits(item.bits)
+            self.record_dataset_metadata(legacy_key, metrics)
+            self.record_dataset_metadata(native_key, metrics)
 
     def dataset_summary(self) -> list[DatasetSummary]:
         summaries = []
         for name, key in self.dataset_keys.items():
             bitcount_cmd = self.module_cmd("BITCOUNT") if self.args.mode == "module" else "BITCOUNT"
+            metadata = self.dataset_metadata.get(key, {})
             summaries.append(DatasetSummary(
                 name=name,
                 key=key,
@@ -832,12 +957,17 @@ class RedisBitmapBench:
                 bitcount=int(self.client.execute([bitcount_cmd, key])),
                 memory_usage_bytes=self.memory_usage(key),
                 dump_payload_bytes=self.dump_payload_size(key),
+                max_offset=metadata.get("max_offset"),
+                logical_bytes=metadata.get("logical_bytes"),
+                density=metadata.get("density"),
             ))
         return summaries
 
     def selected_workloads(self) -> list[Workload]:
         workloads = self.workloads()
         all_names = {w.name for w in workloads}
+        if not self.args.only:
+            workloads = self.filter_workloads_by_profile(workloads)
         if self.args.mode == "module":
             module_workloads = []
             for workload in workloads:
@@ -860,6 +990,14 @@ class RedisBitmapBench:
                 f"{', '.join(sorted(unsupported))}"
             )
         return [w for w in workloads if w.name in wanted]
+
+    def filter_workloads_by_profile(self, workloads: list[Workload]) -> list[Workload]:
+        if self.args.benchmark_profile == "full":
+            return workloads
+        if self.args.benchmark_profile == "smoke":
+            return [w for w in workloads if w.name in SMOKE_WORKLOADS]
+        groups = set(PROFILE_GROUPS[self.args.benchmark_profile])
+        return [w for w in workloads if groups.intersection(w.target_groups)]
 
     def module_workload(self, workload: Workload) -> Optional[Workload]:
         if workload.native_only:
@@ -907,6 +1045,7 @@ class RedisBitmapBench:
                 warmup_requests=0, setup="setup_setbit_native_create",
                 sample_key="bench:bitmap:setbit:create",
                 one_shot=True, story="Sparse key creation", dataset="synthetic_sparse",
+                target_groups=("small-sets",),
                 stall_probe=True,
             ),
             Workload(
@@ -917,7 +1056,8 @@ class RedisBitmapBench:
                 warmup_requests=0, setup="setup_setbit_convert_string",
                 sample_key="bench:bitmap:setbit:convert",
                 one_shot=True, story="String-to-native migration",
-                dataset="synthetic_dense", native_only=True, stall_probe=True,
+                dataset="synthetic_dense", target_groups=("bitsets",),
+                native_only=True, stall_probe=True,
             ),
             Workload(
                 "getbit_sparse_native_hit",
@@ -925,6 +1065,7 @@ class RedisBitmapBench:
                 ["GETBIT", DATASET_KEYS["sparse_native"], sparse_hit_offset],
                 80_000, 32, 16, sample_key=DATASET_KEYS["sparse_native"],
                 story="Membership lookup", dataset="synthetic_sparse",
+                target_groups=("small-sets",),
             ),
             Workload(
                 "bitcount_dense_legacy",
@@ -932,6 +1073,7 @@ class RedisBitmapBench:
                 ["BITCOUNT", DATASET_KEYS["dense_legacy"]],
                 50_000, 32, 8, sample_key=DATASET_KEYS["dense_legacy"],
                 story="Count a dense cohort", dataset="synthetic_dense",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitcount_dense_native",
@@ -939,6 +1081,7 @@ class RedisBitmapBench:
                 ["BITCOUNT", DATASET_KEYS["dense_native"]],
                 50_000, 32, 8, sample_key=DATASET_KEYS["dense_native"],
                 story="Count a dense cohort", dataset="synthetic_dense",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitcount_dense_native_range",
@@ -946,6 +1089,7 @@ class RedisBitmapBench:
                 ["BITCOUNT", DATASET_KEYS["dense_native"], "0", str(max(0, self.args.dense_bytes // 2))],
                 50_000, 32, 8, sample_key=DATASET_KEYS["dense_native"],
                 story="Count a segment", dataset="synthetic_dense",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitcount_sparse_native",
@@ -953,6 +1097,7 @@ class RedisBitmapBench:
                 ["BITCOUNT", DATASET_KEYS["sparse_native"]],
                 50_000, 32, 8, sample_key=DATASET_KEYS["sparse_native"],
                 story="Count a sparse cohort", dataset="synthetic_sparse",
+                target_groups=("small-sets",),
             ),
             Workload(
                 "bitpos_clustered_native",
@@ -960,6 +1105,7 @@ class RedisBitmapBench:
                 ["BITPOS", DATASET_KEYS["clustered_native"], "1"],
                 40_000, 24, 8, sample_key=DATASET_KEYS["clustered_native"],
                 story="First match", dataset="synthetic_clustered",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitpos_zero_clustered_native",
@@ -967,6 +1113,7 @@ class RedisBitmapBench:
                 ["BITPOS", DATASET_KEYS["clustered_native"], "0"],
                 40_000, 24, 8, sample_key=DATASET_KEYS["clustered_native"],
                 story="First gap", dataset="synthetic_clustered",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitfield_ro_native_hot",
@@ -975,6 +1122,7 @@ class RedisBitmapBench:
                 80_000, 32, 16,
                 sample_key=DATASET_KEYS["clustered_native"],
                 story="Packed field reads", dataset="synthetic_clustered",
+                target_groups=("bitsets",),
             ),
             Workload(
                 "bitfield_set_native_hot",
@@ -984,6 +1132,27 @@ class RedisBitmapBench:
                 setup="setup_bitfield_native_write",
                 sample_key="bench:bitmap:bitfield:write",
                 story="Packed field writes", dataset="synthetic_sparse",
+                target_groups=("bitsets",),
+            ),
+            Workload(
+                "bitop_and_all_string",
+                "BITOP AND with all string bitmap sources",
+                ["BITOP", "AND", "bench:bitmap:bitop:and:string:dest",
+                 DATASET_KEYS["mixed_legacy_a"], DATASET_KEYS["mixed_legacy_c"]],
+                12_000, 12, 4, setup="setup_bitop_mixed",
+                sample_key="bench:bitmap:bitop:and:string:dest",
+                story="Audience intersection", dataset="synthetic_mixed_all_string",
+                target_groups=("mixed-bitop",),
+            ),
+            Workload(
+                "bitop_and_all_native",
+                "BITOP AND with all native bitmap sources",
+                ["BITOP", "AND", "bench:bitmap:bitop:and:native:dest",
+                 DATASET_KEYS["mixed_native_b"], DATASET_KEYS["mixed_native_d"]],
+                12_000, 12, 4, setup="setup_bitop_mixed",
+                sample_key="bench:bitmap:bitop:and:native:dest",
+                story="Audience intersection", dataset="synthetic_mixed_all_native",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_and_mixed",
@@ -994,6 +1163,7 @@ class RedisBitmapBench:
                 12_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:and:dest",
                 story="Audience intersection", dataset="synthetic_mixed",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_or_mixed",
@@ -1004,6 +1174,7 @@ class RedisBitmapBench:
                 12_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:or:dest",
                 story="Reach / union", dataset="synthetic_mixed",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_xor_mixed",
@@ -1014,6 +1185,7 @@ class RedisBitmapBench:
                 12_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:xor:dest",
                 story="Symmetric difference", dataset="synthetic_mixed",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_not_native",
@@ -1022,6 +1194,7 @@ class RedisBitmapBench:
                 10_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:not:dest",
                 story="Exclusion / suppression", dataset="synthetic_clustered",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_diff1_mixed",
@@ -1032,6 +1205,7 @@ class RedisBitmapBench:
                 12_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:diff1:dest",
                 story="Difference / suppression", dataset="synthetic_mixed",
+                target_groups=("mixed-bitop",),
             ),
             Workload(
                 "bitop_one_mixed",
@@ -1042,6 +1216,7 @@ class RedisBitmapBench:
                 12_000, 12, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:bitop:one:dest",
                 story="Exactly-one filter", dataset="synthetic_mixed",
+                target_groups=("mixed-bitop",),
             ),
         ]
         workloads.extend(self.realdata_workloads())
@@ -1057,6 +1232,7 @@ class RedisBitmapBench:
                 ["BITCOUNT", native_key],
                 30_000, 24, 8, sample_key=native_key,
                 story="Count a realdata cohort", dataset=item.name,
+                target_groups=("small-sets",),
             ))
         if len(self.realdata) >= 2:
             a = self.realdata[0].name
@@ -1069,6 +1245,7 @@ class RedisBitmapBench:
                 8_000, 8, 4, setup="setup_bitop_mixed",
                 sample_key="bench:bitmap:real:and:dest",
                 story="Realdata intersection", dataset=f"{a}+{b}",
+                target_groups=("small-sets", "mixed-bitop"),
             ))
         return workloads
 
@@ -1093,6 +1270,8 @@ class RedisBitmapBench:
 
     def setup_bitop_mixed(self) -> None:
         keys = [
+            "bench:bitmap:bitop:and:string:dest",
+            "bench:bitmap:bitop:and:native:dest",
             "bench:bitmap:bitop:and:dest",
             "bench:bitmap:bitop:or:dest",
             "bench:bitmap:bitop:xor:dest",
@@ -1107,9 +1286,12 @@ class RedisBitmapBench:
         self.client.execute(["DEL", *keys])
 
     def run_workload(self, workload: Workload) -> Result:
+        sample_count = max(1, self.args.runs)
+        if workload.one_shot:
+            sample_count = max(sample_count, self.args.one_shot_min_runs)
         samples = [
             self.run_workload_sample(workload, run_index)
-            for run_index in range(max(1, self.args.runs))
+            for run_index in range(sample_count)
         ]
         return self.aggregate_samples(workload, samples)
 
@@ -1127,7 +1309,11 @@ class RedisBitmapBench:
         elapsed = elapsed_ms(start)
         after = self.memory_snapshot()
         qps = self.parse_qps(raw)
+        if qps <= 0:
+            qps = None
         key = workload.sample_key
+        requests = self.scale_requests(workload.requests)
+        per_op = time_per_op_us(elapsed, requests, qps)
         return Result(
             name=workload.name,
             category="command",
@@ -1139,11 +1325,12 @@ class RedisBitmapBench:
             used_memory_peak=after.get("used_memory_peak"),
             payload_size_bytes=self.dump_payload_size(key) if key else None,
             qps=qps,
-            requests=self.scale_requests(workload.requests),
+            requests=requests,
             clients=workload.clients,
             pipeline=workload.pipeline,
             rand_range=workload.rand_range,
             command=workload.command,
+            time_per_op_us=per_op,
             extra=self.result_extra(workload, run_index, {"raw_output": raw.strip()}),
         )
 
@@ -1168,6 +1355,7 @@ class RedisBitmapBench:
         stall = canary.stats()
         if stall is not None:
             extra["stall"] = asdict(stall)
+        per_op = time_per_op_us(elapsed, 1, None)
         return Result(
             name=workload.name,
             category="command",
@@ -1183,6 +1371,7 @@ class RedisBitmapBench:
             pipeline=1,
             rand_range=workload.rand_range,
             command=workload.command,
+            time_per_op_us=per_op,
             extra=self.result_extra(workload, run_index, extra),
         )
 
@@ -1199,6 +1388,7 @@ class RedisBitmapBench:
             payload["story"] = workload.story
         if workload.dataset:
             payload["dataset"] = workload.dataset
+        payload["target_groups"] = list(workload.target_groups)
         payload.update(extra)
         return payload
 
@@ -1207,10 +1397,18 @@ class RedisBitmapBench:
             return samples[0]
         qps_values = [sample.qps for sample in samples if sample.qps is not None]
         elapsed_values = [sample.elapsed_ms for sample in samples]
+        per_op_values = [sample.time_per_op_us for sample in samples if sample.time_per_op_us is not None]
+        per_op_stats = sample_stats(per_op_values)
         extra = self.result_extra(workload, -1, {
             "runs": len(samples),
             "elapsed_ms_min": min(elapsed_values),
             "elapsed_ms_max": max(elapsed_values),
+            "time_per_op_us_mean": per_op_stats["mean"],
+            "time_per_op_us_median": per_op_stats["median"],
+            "time_per_op_us_min": per_op_stats["min"],
+            "time_per_op_us_max": per_op_stats["max"],
+            "time_per_op_us_stdev": per_op_stats["stdev"],
+            "time_per_op_us_cv_percent": per_op_stats["cv_percent"],
             "samples": [asdict(sample) for sample in samples],
         })
         if qps_values:
@@ -1232,6 +1430,7 @@ class RedisBitmapBench:
             pipeline=samples[0].pipeline,
             rand_range=samples[0].rand_range,
             command=samples[0].command,
+            time_per_op_us=per_op_stats["median"],
             extra=extra,
         )
 
@@ -1265,7 +1464,10 @@ class RedisBitmapBench:
         return float(match.group(1))
 
     def scale_requests(self, requests: int) -> int:
-        return max(1, int(requests * self.args.request_scale))
+        scaled = max(1, int(requests * self.args.request_scale))
+        if requests > 1:
+            return max(self.args.min_requests, scaled)
+        return scaled
 
     def run_persistence_suite(self) -> None:
         print("\nrunning persistence benchmarks...", file=sys.stderr)
@@ -1427,24 +1629,29 @@ class RedisBitmapBench:
 
     def print_dataset_summary(self) -> None:
         print("dataset:")
-        print("| name | type | encoding | bitcount | memory bytes | dump bytes |")
-        print("|---|---|---|---:|---:|---:|")
+        print("| name | type | encoding | bitcount | max offset | logical bytes | density | memory bytes | dump bytes |")
+        print("|---|---|---|---:|---:|---:|---:|---:|---:|")
         for item in self.datasets:
             print(
                 f"| {item.name} | {item.redis_type} | {item.encoding} | "
-                f"{item.bitcount} | {fmt_optional(item.memory_usage_bytes)} | "
+                f"{item.bitcount} | {fmt_optional(item.max_offset)} | "
+                f"{fmt_optional(item.logical_bytes)} | {fmt_ratio(item.density)} | "
+                f"{fmt_optional(item.memory_usage_bytes)} | "
                 f"{fmt_optional(item.dump_payload_bytes)} |"
             )
 
     def print_summary(self) -> None:
         print("\ncommand summary:")
-        print("| story | workload | qps | elapsed/latency ms | memory bytes | peak bytes | stall ms | payload bytes |")
-        print("|---|---|---:|---:|---:|---:|---:|---:|")
+        print("| story | groups | workload | time/op us | stdev us | qps | elapsed/latency ms | memory bytes | peak bytes | stall ms | payload bytes |")
+        print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for result in self.results:
-            qps = "-" if result.qps is None else f"{result.qps:.2f}"
+            qps = "N/A" if result.qps is None else f"{result.qps:.2f}"
+            target_groups = ",".join(result.extra.get("target_groups", [])) or "-"
             stall = result_stall_ms(result)
             print(
-                f"| {result.extra.get('story', '-')} | {result.name} | {qps} | {result.elapsed_ms:.2f} | "
+                f"| {result.extra.get('story', '-')} | {target_groups} | {result.name} | "
+                f"{fmt_float(result.time_per_op_us)} | {fmt_float(result.extra.get('time_per_op_us_stdev'))} | "
+                f"{qps} | {result.elapsed_ms:.2f} | "
                 f"{fmt_optional(result.memory_usage_bytes)} | "
                 f"{fmt_optional(result.used_memory_peak)} | "
                 f"{fmt_float(stall)} | "
@@ -1474,6 +1681,8 @@ class RedisBitmapBench:
             "db": self.db,
             "environment": self.environment,
             "parameters": {
+                "benchmark_profile": self.args.benchmark_profile,
+                "report_view": self.args.report_view,
                 "dense_bytes": self.args.dense_bytes,
                 "sparse_space": self.args.sparse_space,
                 "sparse_count": self.args.sparse_count,
@@ -1481,7 +1690,9 @@ class RedisBitmapBench:
                 "cluster_span": self.args.cluster_span,
                 "cluster_gap": self.args.cluster_gap,
                 "request_scale": self.args.request_scale,
+                "min_requests": self.args.min_requests,
                 "runs": self.args.runs,
+                "one_shot_min_runs": self.args.one_shot_min_runs,
             },
             "datasets": [asdict(d) for d in self.datasets],
             "results": [asdict(r) for r in self.results],
@@ -1509,25 +1720,48 @@ class RedisBitmapBench:
             f"# Redis Native Bitmap Benchmark ({self.args.mode_label})",
             "",
             f"- Mode: `{self.args.mode}`",
+            f"- Benchmark profile: `{self.args.benchmark_profile}`",
+            f"- Report view: `{self.args.report_view}`",
             f"- Redis: `{self.environment.get('redis_version', 'unknown')}`",
             f"- Source SHA: `{self.environment.get('source_sha', 'unknown')}`",
             f"- Runner: `{self.environment.get('runner_name', 'local')}`",
             "",
-            "| Story | Dataset | Workload | Metric | Value | Memory | Peak | Payload | Stall | Notes |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            "| Dataset | Type | Encoding | Bitcount | Max Offset | Logical Bytes | Density | Memory | Payload |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
+        for item in self.datasets:
+            lines.append(
+                f"| {item.name} | {item.redis_type} | {item.encoding} | {item.bitcount} | "
+                f"{fmt_optional(item.max_offset)} | {fmt_optional(item.logical_bytes)} | "
+                f"{fmt_ratio(item.density)} | {fmt_optional(item.memory_usage_bytes)} | "
+                f"{fmt_optional(item.dump_payload_bytes)} |"
+            )
+        lines.extend([
+            "",
+            "| Story | Dataset | Groups | Workload | Metric | Value | Time/Op us | Mean us | Median us | Min us | Max us | Stdev us | CV % | QPS | Memory | Peak | Payload | Stall | Notes |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ])
         for result in self.results + self.persistence_results:
             row = self.result_row(result)
             lines.append(
-                f"| {row['story']} | {row['dataset']} | {row['workload']} | {row['metric']} | "
-                f"{row['value']} | {row['memory_bytes']} | {row['peak_bytes']} | "
+                f"| {row['story']} | {row['dataset']} | {row['target_groups']} | {row['workload']} | "
+                f"{row['metric']} | {row['value']} | {row['time_per_op_us']} | "
+                f"{row['time_per_op_mean_us']} | {row['time_per_op_median_us']} | "
+                f"{row['time_per_op_min_us']} | {row['time_per_op_max_us']} | "
+                f"{row['time_per_op_stdev_us']} | {row['time_per_op_cv_percent']} | "
+                f"{row['qps']} | {row['memory_bytes']} | {row['peak_bytes']} | "
                 f"{row['payload_bytes']} | {row['stall_ms']} | {row['notes']} |"
             )
         return lines
 
     def result_row(self, result: Result) -> dict[str, Any]:
-        metric = "qps" if result.qps is not None else "elapsed_ms"
-        value = f"{result.qps:.2f}" if result.qps is not None else f"{result.elapsed_ms:.2f}"
+        metric = "time_per_op_us" if result.time_per_op_us is not None else "elapsed_ms"
+        value = f"{result.time_per_op_us:.2f}" if result.time_per_op_us is not None else f"{result.elapsed_ms:.2f}"
+        def time_stat(name: str, fallback_to_primary: bool = False) -> Optional[float]:
+            stat = result.extra.get(f"time_per_op_us_{name}")
+            if stat is None and fallback_to_primary:
+                return result.time_per_op_us
+            return stat
         notes = []
         if result.extra.get("runs"):
             notes.append(f"runs={result.extra['runs']}")
@@ -1537,6 +1771,7 @@ class RedisBitmapBench:
             notes.append(f"payload_format={result.extra['payload_format']}")
         return {
             "mode": self.args.mode_label,
+            "target_groups": ",".join(result.extra.get("target_groups", [])) or "-",
             "category": result.category,
             "story": result.extra.get("story", result.category),
             "dataset": result.extra.get("dataset", "-"),
@@ -1544,7 +1779,14 @@ class RedisBitmapBench:
             "metric": metric,
             "value": value,
             "elapsed_ms": f"{result.elapsed_ms:.2f}",
-            "qps": "" if result.qps is None else f"{result.qps:.2f}",
+            "time_per_op_us": fmt_float(result.time_per_op_us),
+            "time_per_op_mean_us": fmt_float(time_stat("mean", True)),
+            "time_per_op_median_us": fmt_float(time_stat("median", True)),
+            "time_per_op_min_us": fmt_float(time_stat("min", True)),
+            "time_per_op_max_us": fmt_float(time_stat("max", True)),
+            "time_per_op_stdev_us": fmt_float(result.extra.get("time_per_op_us_stdev")),
+            "time_per_op_cv_percent": fmt_float(result.extra.get("time_per_op_us_cv_percent")),
+            "qps": "N/A" if result.qps is None else f"{result.qps:.2f}",
             "memory_bytes": fmt_optional(result.memory_usage_bytes),
             "peak_bytes": fmt_optional(result.used_memory_peak),
             "payload_bytes": fmt_optional(result.payload_size_bytes),
@@ -1572,6 +1814,10 @@ def fmt_optional(value: Optional[int]) -> str:
 
 def fmt_float(value: Optional[float]) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+def fmt_ratio(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.6f}"
 
 
 def median_optional(values: Iterable[Optional[int]]) -> Optional[int]:
@@ -1651,11 +1897,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-server", action="store_true",
                         help="Do not stop the ephemeral server after the run")
     parser.add_argument("--only", help="Comma-separated command workload names to run")
+    parser.add_argument("--benchmark-profile", choices=("full", "smoke", "small-sets", "bitsets", "mixed-bitop"),
+                        default="full",
+                        help="Workload profile to run when --only is not supplied")
+    parser.add_argument("--report-view", choices=("performance", "memory", "payload", "combined"),
+                        default="combined",
+                        help="Compare Markdown sections to publish")
     parser.add_argument("--skip-persistence", action="store_true",
                         help="Skip DUMP/RESTORE, RDB save/load, and AOF rewrite phases")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--request-scale", type=float, default=1.0,
                         help="Scale factor applied to command workload request counts")
+    parser.add_argument("--min-requests", type=int, default=1000,
+                        help="Minimum measured redis-benchmark requests for scaled multi-request workloads")
+    parser.add_argument("--one-shot-min-runs", type=int, default=5,
+                        help="Minimum samples for one-shot latency workloads")
     parser.add_argument("--warmup", action="store_true", default=True,
                         help="Run workload warmups where defined (default: enabled)")
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
@@ -1790,12 +2046,14 @@ def run_compare(args: argparse.Namespace) -> int:
     comparison = compare_payloads(payloads)
     combined = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "benchmark_profile": args.benchmark_profile,
+        "report_view": args.report_view,
         "labels": [payload.get("mode_label", payload.get("mode", "run")) for payload in payloads],
         "runs": payloads,
         "comparison": comparison,
     }
     json_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
-    markdown_path.write_text("\n".join(compare_markdown_lines(comparison, payloads)) + "\n",
+    markdown_path.write_text("\n".join(compare_markdown_lines(comparison, payloads, args.report_view)) + "\n",
                              encoding="utf-8")
     write_compare_csv(csv_path, comparison)
     print(f"compare json written to {json_path}")
@@ -1819,21 +2077,51 @@ def compare_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["category"] = first.get("category", "")
         row["story"] = first.get("extra", {}).get("story", row["category"])
         row["dataset"] = first.get("extra", {}).get("dataset", "-")
-        row["metric"] = "qps" if first.get("qps") is not None else "elapsed_ms"
-        row["metric_direction"] = "higher_is_better" if row["metric"] == "qps" else "lower_is_better"
+        row["target_groups"] = ",".join(first.get("extra", {}).get("target_groups", [])) or "-"
+        row["metric"] = "time_per_op_us" if first.get("time_per_op_us") is not None else "elapsed_ms"
+        row["metric_direction"] = "lower_is_better"
         for label in all_labels:
             result = by_name[name].get(label)
             row[label] = compare_result_value(result) if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_mean_us"] = compare_result_time_stat(result, "mean") if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_median_us"] = compare_result_time_stat(result, "median") if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_min_us"] = compare_result_time_stat(result, "min") if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_max_us"] = compare_result_time_stat(result, "max") if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_stdev_us"] = compare_result_stdev(result) if result else missing_compare_value(label)
+            row[f"{label}_time_per_op_cv_percent"] = compare_result_time_stat(result, "cv_percent") if result else missing_compare_value(label)
+            row[f"{label}_qps"] = compare_result_qps(result) if result else missing_compare_value(label)
+            row[f"{label}_memory_bytes"] = result.get("memory_usage_bytes") if result else missing_compare_value(label)
+            row[f"{label}_payload_bytes"] = result.get("payload_size_bytes") if result else missing_compare_value(label)
         row["core_vs_string_percent"] = metric_delta_percent(
             row.get("redis_pr_native"),
             row.get("redis_before"),
-            row["metric"],
+            row["metric_direction"],
         )
         row["native_delta_percent"] = row["core_vs_string_percent"]
         row["core_vs_module_percent"] = metric_delta_percent(
             row.get("redis_pr_native"),
             row.get(MODULE_RESULT_LABEL),
-            row["metric"],
+            row["metric_direction"],
+        )
+        row["memory_core_vs_string_percent"] = metric_delta_percent(
+            row.get("redis_pr_native_memory_bytes"),
+            row.get("redis_before_memory_bytes"),
+            "lower_is_better",
+        )
+        row["memory_core_vs_module_percent"] = metric_delta_percent(
+            row.get("redis_pr_native_memory_bytes"),
+            row.get(f"{MODULE_RESULT_LABEL}_memory_bytes"),
+            "lower_is_better",
+        )
+        row["payload_core_vs_string_percent"] = metric_delta_percent(
+            row.get("redis_pr_native_payload_bytes"),
+            row.get("redis_before_payload_bytes"),
+            "lower_is_better",
+        )
+        row["payload_core_vs_module_percent"] = metric_delta_percent(
+            row.get("redis_pr_native_payload_bytes"),
+            row.get(f"{MODULE_RESULT_LABEL}_payload_bytes"),
+            "lower_is_better",
         )
         notes = []
         if row.get(MODULE_RESULT_LABEL) == "N/A":
@@ -1845,7 +2133,8 @@ def compare_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, Any]]) -> list[str]:
+def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, Any]],
+                           report_view: str = "combined") -> list[str]:
     lines = [
         "# Redis Native Bitmap Benchmark Compare",
         "",
@@ -1860,39 +2149,132 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
             f"{env.get('module_sha', '-') or '-'} | "
             f"{env.get('runner_name', 'local')} |"
         )
+
+    lines.extend(["", "Delta columns are positive when Redis core Roaring is better."])
+
+    if report_view in ("performance", "combined"):
+        append_performance_compare(lines, rows)
+    if report_view in ("memory", "combined"):
+        append_resource_compare(
+            lines,
+            rows,
+            title="Memory Usage",
+            field_suffix="memory_bytes",
+            string_delta="memory_core_vs_string_percent",
+            module_delta="memory_core_vs_module_percent",
+        )
+    if report_view in ("payload", "combined"):
+        append_resource_compare(
+            lines,
+            rows,
+            title="Serialized Payload",
+            field_suffix="payload_bytes",
+            string_delta="payload_core_vs_string_percent",
+            module_delta="payload_core_vs_module_percent",
+        )
+    return lines
+
+
+def append_performance_compare(lines: list[str], rows: list[dict[str, Any]]) -> None:
     lines.extend([
         "",
-        "Delta columns are metric-aware: positive means higher QPS for throughput rows and lower elapsed_ms for latency, payload, memory, and persistence rows.",
+        "## Performance",
         "",
-        "| Story | Dataset | Workload | Metric | Redis string | Redis core Roaring | redis-roaring module | Core vs string | Core vs module | Notes |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Story | Dataset | Groups | Workload | Metric | Redis string | String stdev | Redis core Roaring | Core stdev | redis-roaring module | Module stdev | Core vs string | Core vs module | Notes |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ])
     for row in rows:
         lines.append(
-            f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row['workload']} | "
+            f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row.get('target_groups', '-')} | {row['workload']} | "
             f"{row.get('metric', '-')} | {fmt_any(row.get('redis_before'))} | "
-            f"{fmt_any(row.get('redis_pr_native'))} | {fmt_any(row.get(MODULE_RESULT_LABEL))} | "
+            f"{fmt_any(row.get('redis_before_time_per_op_stdev_us'))} | "
+            f"{fmt_any(row.get('redis_pr_native'))} | {fmt_any(row.get('redis_pr_native_time_per_op_stdev_us'))} | "
+            f"{fmt_any(row.get(MODULE_RESULT_LABEL))} | {fmt_any(row.get(f'{MODULE_RESULT_LABEL}_time_per_op_stdev_us'))} | "
             f"{fmt_delta(row.get('core_vs_string_percent'))} | "
             f"{fmt_delta(row.get('core_vs_module_percent'))} | {row.get('notes', '-')} |"
         )
-    return lines
+
+
+def append_resource_compare(lines: list[str], rows: list[dict[str, Any]], title: str,
+                            field_suffix: str, string_delta: str, module_delta: str) -> None:
+    resource_rows = [
+        row for row in rows
+        if any(isinstance(row.get(f"{label}_{field_suffix}"), (int, float)) for label in COMPARE_LABELS)
+    ]
+    lines.extend([
+        "",
+        f"## {title}",
+        "",
+        "| Story | Dataset | Groups | Workload | Redis string | Redis core Roaring | redis-roaring module | Core vs string | Core vs module | Notes |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ])
+    for row in resource_rows:
+        lines.append(
+            f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row.get('target_groups', '-')} | {row['workload']} | "
+            f"{fmt_any(row.get(f'redis_before_{field_suffix}'))} | "
+            f"{fmt_any(row.get(f'redis_pr_native_{field_suffix}'))} | "
+            f"{fmt_any(row.get(f'{MODULE_RESULT_LABEL}_{field_suffix}'))} | "
+            f"{fmt_delta(row.get(string_delta))} | {fmt_delta(row.get(module_delta))} | "
+            f"{row.get('notes', '-')} |"
+        )
 
 
 def write_compare_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "story",
         "dataset",
+        "target_groups",
         "workload",
         "category",
         "metric",
         "metric_direction",
         "redis_before",
+        "redis_before_time_per_op_mean_us",
+        "redis_before_time_per_op_median_us",
+        "redis_before_time_per_op_min_us",
+        "redis_before_time_per_op_max_us",
+        "redis_before_time_per_op_stdev_us",
+        "redis_before_time_per_op_cv_percent",
+        "redis_before_qps",
+        "redis_before_memory_bytes",
+        "redis_before_payload_bytes",
         "redis_pr_native",
+        "redis_pr_native_time_per_op_mean_us",
+        "redis_pr_native_time_per_op_median_us",
+        "redis_pr_native_time_per_op_min_us",
+        "redis_pr_native_time_per_op_max_us",
+        "redis_pr_native_time_per_op_stdev_us",
+        "redis_pr_native_time_per_op_cv_percent",
+        "redis_pr_native_qps",
+        "redis_pr_native_memory_bytes",
+        "redis_pr_native_payload_bytes",
         MODULE_RESULT_LABEL,
+        f"{MODULE_RESULT_LABEL}_time_per_op_mean_us",
+        f"{MODULE_RESULT_LABEL}_time_per_op_median_us",
+        f"{MODULE_RESULT_LABEL}_time_per_op_min_us",
+        f"{MODULE_RESULT_LABEL}_time_per_op_max_us",
+        f"{MODULE_RESULT_LABEL}_time_per_op_stdev_us",
+        f"{MODULE_RESULT_LABEL}_time_per_op_cv_percent",
+        f"{MODULE_RESULT_LABEL}_qps",
+        f"{MODULE_RESULT_LABEL}_memory_bytes",
+        f"{MODULE_RESULT_LABEL}_payload_bytes",
         "core_vs_string_percent",
         "core_vs_module_percent",
+        "memory_core_vs_string_percent",
+        "memory_core_vs_module_percent",
+        "payload_core_vs_string_percent",
+        "payload_core_vs_module_percent",
         "native_delta_percent",
         "redis_pr_legacy",
+        "redis_pr_legacy_time_per_op_mean_us",
+        "redis_pr_legacy_time_per_op_median_us",
+        "redis_pr_legacy_time_per_op_min_us",
+        "redis_pr_legacy_time_per_op_max_us",
+        "redis_pr_legacy_time_per_op_stdev_us",
+        "redis_pr_legacy_time_per_op_cv_percent",
+        "redis_pr_legacy_qps",
+        "redis_pr_legacy_memory_bytes",
+        "redis_pr_legacy_payload_bytes",
         "notes",
     ]
     with open(path, "w", newline="", encoding="utf-8") as fp:
@@ -1905,22 +2287,41 @@ def write_compare_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def compare_result_value(result: Optional[dict[str, Any]]) -> Any:
     if not result:
         return None
-    value = result.get("qps")
-    if value is None:
-        value = result.get("elapsed_ms")
+    value = result.get("time_per_op_us")
+    if value is not None:
+        return value
+    return result.get("elapsed_ms")
+
+
+def compare_result_stdev(result: Optional[dict[str, Any]]) -> Any:
+    return compare_result_time_stat(result, "stdev")
+
+
+def compare_result_time_stat(result: Optional[dict[str, Any]], name: str) -> Any:
+    if not result:
+        return None
+    value = result.get("extra", {}).get(f"time_per_op_us_{name}")
+    if value is None and name in ("mean", "median", "min", "max"):
+        return result.get("time_per_op_us")
     return value
+
+
+def compare_result_qps(result: Optional[dict[str, Any]]) -> Any:
+    if not result:
+        return None
+    return result.get("qps") if result.get("qps") is not None else "N/A"
 
 
 def missing_compare_value(label: str) -> Any:
     return "N/A" if label == MODULE_RESULT_LABEL else None
 
 
-def metric_delta_percent(candidate: Any, baseline: Any, metric: str) -> Optional[float]:
+def metric_delta_percent(candidate: Any, baseline: Any, direction: str) -> Optional[float]:
     if not isinstance(candidate, (int, float)) or not isinstance(baseline, (int, float)):
         return None
     if baseline == 0:
         return None
-    if metric == "elapsed_ms":
+    if direction == "lower_is_better":
         return (baseline - candidate) / baseline * 100.0
     return (candidate - baseline) / baseline * 100.0
 

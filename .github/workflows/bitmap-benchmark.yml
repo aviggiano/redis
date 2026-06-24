@@ -18,6 +18,12 @@ on:
       redis_roaring_ref:
         description: "aviggiano/redis-roaring commit SHA/ref to build as the module; use a full SHA for publishable numbers"
         default: "master"
+      benchmark_profile:
+        description: "Benchmark profile: full, smoke, small-sets, bitsets, or mixed-bitop"
+        default: "full"
+      report_view:
+        description: "Report view: combined, performance, memory, or payload"
+        default: "combined"
       request_scale:
         description: "Multiplier for command benchmark request counts"
         default: "1.0"
@@ -135,6 +141,8 @@ jobs:
             echo "redis_roaring_ref_input=$REDIS_ROARING_REF"
             echo "redis_roaring_sha=$REDIS_ROARING_SHA"
             echo "redis_roaring_module=$REDIS_ROARING_MODULE"
+            echo "benchmark_profile=${{ inputs.benchmark_profile }}"
+            echo "report_view=${{ inputs.report_view }}"
             uname -a
             lscpu || true
             free -h || true
@@ -151,6 +159,8 @@ jobs:
             --compare-legacy-src-dir "$GITHUB_WORKSPACE/after/src" \
             --compare-out "$GITHUB_WORKSPACE/bitmap-bench-results/bitmap-bench-compare" \
             --module-sha "$REDIS_ROARING_SHA" \
+            --benchmark-profile "${{ inputs.benchmark_profile }}" \
+            --report-view "${{ inputs.report_view }}" \
             --request-scale "${{ inputs.request_scale }}" \
             --runs "${{ inputs.runs }}" \
             --ping-canary \

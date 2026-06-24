@@ -49,6 +49,22 @@ checkouts. The compare JSON and Markdown also include each Redis run's actual
 The workflow uploads JSON, CSV, Markdown, and runner metadata artifacts under
 `bitmap-bench-results`.
 
+Use `benchmark_profile` to choose the workload family:
+
+- `small-sets`: sparse/high-offset integer-set-like datasets and CRoaring
+  realdata inputs.
+- `bitsets`: dense, clustered, and packed-field bitmap workloads.
+- `mixed-bitop`: all-string, all-native, and mixed-source BITOP workloads.
+- `smoke`: short sanity profile with request floors to avoid misleading
+  `0.00 qps` rows.
+- `full`: all benchmark families.
+
+Use `report_view` to publish `performance`, `memory`, `payload`, or the
+default `combined` Markdown report. Performance rows use `time_per_op_us` as
+the primary metric and keep QPS as secondary data in JSON/CSV. Repeated samples
+also publish mean, median, min, max, standard deviation, and coefficient of
+variation fields for `time_per_op_us`.
+
 ## Local Examples
 
 Run the candidate build only:
@@ -74,6 +90,8 @@ python3 tools/bitmap-bench.py \
   --compare-module-path /path/to/libredis-roaring.so \
   --compare-legacy-src-dir /path/to/after/src \
   --compare-out bitmap-bench-compare \
+  --benchmark-profile full \
+  --report-view combined \
   --runs 3 \
   --ping-canary \
   --croaring-realdata-dir /tmp/croaring-realdata \
@@ -85,11 +103,16 @@ Keep developer runs small with `--request-scale 0.05`, `--skip-persistence`, or
 to justify exposure/default decisions.
 
 Compare output reports `native_delta_percent` as a metric-aware improvement:
-positive means higher QPS for throughput rows and lower `elapsed_ms` for
-latency or persistence rows. The published Markdown table focuses on Redis
-string, Redis core Roaring, and redis-roaring module columns; unsupported
-module rows are marked `N/A`. The optional `redis_pr_legacy` guardrail remains
-available in JSON and CSV.
+positive means lower `time_per_op_us` for command rows and lower `elapsed_ms`
+for persistence rows. The published Markdown table focuses on Redis string,
+Redis core Roaring, and redis-roaring module columns; unsupported module rows
+are marked `N/A`. The optional `redis_pr_legacy` guardrail remains available in
+JSON and CSV.
+
+The compare Markdown is split into first-class performance, memory, and
+serialized-payload sections. Dataset metadata includes bitcount, max set
+offset, logical byte length, and density so sparse small-set rows are not mixed
+with dense bitset rows without context.
 
 ## Decision Questions
 
