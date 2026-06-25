@@ -2502,7 +2502,7 @@ def fmt_delta(value: Any) -> str:
     if value is None or value == "":
         return "-"
     if isinstance(value, float):
-        return f"{value:+.2f}"
+        return f"{value:+.0f}"
     return str(value)
 
 
