@@ -169,6 +169,33 @@ jobs:
             --realdata-archives "${{ inputs.realdata_archives }}" \
             ${{ inputs.extra_args }}
 
+      - name: Publish benchmark report summary
+        if: ${{ always() }}
+        run: |
+          report="$GITHUB_WORKSPACE/bitmap-bench-results/bitmap-bench-compare.md"
+          summary_limit=900000
+          {
+            echo "## Bitmap Benchmark Report"
+            echo
+            echo "- Benchmark profile: \`${{ inputs.benchmark_profile }}\`"
+            echo "- Report view: \`${{ inputs.report_view }}\`"
+            echo "- Candidate SHA: \`$AFTER_SHA\`"
+            echo
+            if [ -s "$report" ]; then
+              report_bytes="$(wc -c < "$report")"
+              if [ "$report_bytes" -gt "$summary_limit" ]; then
+                head -c "$summary_limit" "$report"
+                echo
+                echo
+                echo "_Report truncated in the job summary; download the artifact for the full report._"
+              else
+                cat "$report"
+              fi
+            else
+              echo "Benchmark report was not generated. Check the benchmark step logs for details."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
