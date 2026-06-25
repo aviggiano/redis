@@ -2354,7 +2354,9 @@ def fmt_performance_cell(row: dict[str, Any], label: str) -> str:
 
 
 def fmt_value_with_uncertainty(value: float, uncertainty: float) -> tuple[str, str]:
-    if uncertainty == 0 or not math.isfinite(uncertainty):
+    if uncertainty == 0:
+        return fmt_any(value), "0"
+    if not math.isfinite(uncertainty):
         return fmt_any(value), fmt_any(uncertainty)
     decimals = uncertainty_decimal_places(abs(uncertainty), significant_digits=2)
     return format_rounded_number(value, decimals), format_rounded_number(uncertainty, decimals)
