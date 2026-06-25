@@ -179,7 +179,7 @@ jobs:
             echo
             echo "- Benchmark profile: \`${{ inputs.benchmark_profile }}\`"
             echo "- Report view: \`${{ inputs.report_view }}\`"
-            echo "- Candidate SHA: \`$AFTER_SHA\`"
+            echo "- Candidate: [redis_pr_native](https://github.com/${{ github.repository }}/commit/$AFTER_SHA)"
             echo
             if [ -s "$report" ]; then
               report_bytes="$(wc -c < "$report")"

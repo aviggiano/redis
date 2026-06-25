@@ -629,8 +629,10 @@ class RedisBitmapBench:
             "runner_arch": os.environ.get("RUNNER_ARCH", platform.machine()),
             "github_sha": os.environ.get("GITHUB_SHA", ""),
             "source_sha": self.git_sha_for_src_dir(),
+            "source_repo_url": self.git_remote_for_src_dir(),
             "module_path": str(Path(self.args.module_path).resolve()) if self.args.module_path else "",
             "module_sha": self.git_sha_for_module(),
+            "module_repo_url": self.git_remote_for_module(),
             "module_command_prefix": self.args.module_command_prefix if self.args.mode == "module" else "",
             "redis_version": info.get("redis_version", ""),
             "redis_git_sha1": info.get("redis_git_sha1", ""),
@@ -659,6 +661,10 @@ class RedisBitmapBench:
         except Exception:
             return ""
 
+    def git_remote_for_src_dir(self) -> str:
+        repo = self.src_dir.parent if self.src_dir.name == "src" else self.src_dir
+        return git_remote_url(repo)
+
     def git_sha_for_module(self) -> str:
         if self.args.mode != "module" and not self.args.module_path:
             return ""
@@ -677,6 +683,13 @@ class RedisBitmapBench:
             ).strip()
         except Exception:
             return ""
+
+    def git_remote_for_module(self) -> str:
+        if self.args.mode != "module" and not self.args.module_path:
+            return ""
+        if not self.args.module_path:
+            return ""
+        return git_remote_url(Path(self.args.module_path))
 
     @staticmethod
     def binary_version(binary: str) -> str:
@@ -1799,6 +1812,59 @@ def elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
 
+def git_remote_url(repo_or_path: Path) -> str:
+    repo = repo_or_path.parent if repo_or_path.is_file() else repo_or_path
+    try:
+        remote = subprocess.check_output(
+            ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return ""
+    return normalize_git_remote_url(remote)
+
+
+def normalize_git_remote_url(remote: str) -> str:
+    remote = remote.strip()
+    if not remote:
+        return ""
+    if remote.startswith("git@github.com:"):
+        remote = "https://github.com/" + remote[len("git@github.com:"):]
+    elif remote.startswith("ssh://git@github.com/"):
+        remote = "https://github.com/" + remote[len("ssh://git@github.com/"):]
+    if remote.endswith(".git"):
+        remote = remote[:-4]
+    return remote.rstrip("/")
+
+
+def git_commit_url(repo_url: str, sha: str) -> str:
+    if not repo_url or not sha:
+        return ""
+    if "github.com/" not in repo_url:
+        return ""
+    return f"{repo_url}/commit/{sha}"
+
+
+def short_sha(sha: str) -> str:
+    return sha[:12] if sha else ""
+
+
+def markdown_escape(text: str) -> str:
+    return str(text).replace("|", "\\|")
+
+
+def markdown_commit_link(label: str, repo_url: str, sha: str) -> str:
+    label = markdown_escape(label)
+    url = git_commit_url(repo_url, sha)
+    if url:
+        return f"[{label}]({url})"
+    if sha:
+        return f"{label}@`{short_sha(sha)}`"
+    return label
+
+
 def to_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
@@ -2138,15 +2204,26 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
     lines = [
         "# Redis Native Bitmap Benchmark Compare",
         "",
-        "| Run | Mode | Redis | Source SHA | Module SHA | Runner |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Run | Mode | Module | Runner |",
+        "| --- | --- | --- | --- |",
     ]
     for payload in payloads:
         env = payload.get("environment", {})
+        run_link = markdown_commit_link(
+            payload.get("mode_label", "-"),
+            env.get("source_repo_url", ""),
+            env.get("source_sha", ""),
+        )
+        module_link = "-"
+        if env.get("module_sha"):
+            module_link = markdown_commit_link(
+                "redis-roaring",
+                env.get("module_repo_url", ""),
+                env.get("module_sha", ""),
+            )
         lines.append(
-            f"| {payload.get('mode_label', '-')} | {payload.get('mode', '-')} | "
-            f"{env.get('redis_version', '-')} | {env.get('source_sha', '-')} | "
-            f"{env.get('module_sha', '-') or '-'} | "
+            f"| {run_link} | {payload.get('mode', '-')} | "
+            f"{module_link} | "
             f"{env.get('runner_name', 'local')} |"
         )
 
@@ -2167,7 +2244,8 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
         append_resource_compare(
             lines,
             rows,
-            title="Serialized Payload",
+            title="Serialized Payload Size",
+            description="Serialized payload size is the byte count of Redis DUMP/RDB/AOF-style payloads where a workload records one; lower is better.",
             field_suffix="payload_bytes",
             string_delta="payload_core_vs_string_percent",
             module_delta="payload_core_vs_module_percent",
@@ -2180,23 +2258,22 @@ def append_performance_compare(lines: list[str], rows: list[dict[str, Any]]) -> 
         "",
         "## Performance",
         "",
-        "| Story | Dataset | Groups | Workload | Metric | Redis string | String stdev | Redis core Roaring | Core stdev | redis-roaring module | Module stdev | Core vs string | Core vs module | Notes |",
-        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Operation | Redis string | Redis core Roaring | redis-roaring module | Core delta |",
+        "| --- | ---: | ---: | ---: | --- |",
     ])
     for row in rows:
         lines.append(
-            f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row.get('target_groups', '-')} | {row['workload']} | "
-            f"{row.get('metric', '-')} | {fmt_any(row.get('redis_before'))} | "
-            f"{fmt_any(row.get('redis_before_time_per_op_stdev_us'))} | "
-            f"{fmt_any(row.get('redis_pr_native'))} | {fmt_any(row.get('redis_pr_native_time_per_op_stdev_us'))} | "
-            f"{fmt_any(row.get(MODULE_RESULT_LABEL))} | {fmt_any(row.get(f'{MODULE_RESULT_LABEL}_time_per_op_stdev_us'))} | "
-            f"{fmt_delta(row.get('core_vs_string_percent'))} | "
-            f"{fmt_delta(row.get('core_vs_module_percent'))} | {row.get('notes', '-')} |"
+            f"| {compare_operation_label(row)} | "
+            f"{fmt_performance_cell(row, 'redis_before')} | "
+            f"{fmt_performance_cell(row, 'redis_pr_native')} | "
+            f"{fmt_performance_cell(row, MODULE_RESULT_LABEL)} | "
+            f"{fmt_delta_cell(row, 'core_vs_string_percent', 'core_vs_module_percent')} |"
         )
 
 
 def append_resource_compare(lines: list[str], rows: list[dict[str, Any]], title: str,
-                            field_suffix: str, string_delta: str, module_delta: str) -> None:
+                            field_suffix: str, string_delta: str, module_delta: str,
+                            description: str = "") -> None:
     resource_rows = [
         row for row in rows
         if any(isinstance(row.get(f"{label}_{field_suffix}"), (int, float)) for label in COMPARE_LABELS)
@@ -2205,18 +2282,58 @@ def append_resource_compare(lines: list[str], rows: list[dict[str, Any]], title:
         "",
         f"## {title}",
         "",
-        "| Story | Dataset | Groups | Workload | Redis string | Redis core Roaring | redis-roaring module | Core vs string | Core vs module | Notes |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ])
+    if description:
+        lines.extend([description, ""])
+    lines.extend([
+        "| Operation | Redis string | Redis core Roaring | redis-roaring module | Core delta |",
+        "| --- | ---: | ---: | ---: | --- |",
     ])
     for row in resource_rows:
         lines.append(
-            f"| {row.get('story', '-')} | {row.get('dataset', '-')} | {row.get('target_groups', '-')} | {row['workload']} | "
+            f"| {compare_operation_label(row)} | "
             f"{fmt_any(row.get(f'redis_before_{field_suffix}'))} | "
             f"{fmt_any(row.get(f'redis_pr_native_{field_suffix}'))} | "
             f"{fmt_any(row.get(f'{MODULE_RESULT_LABEL}_{field_suffix}'))} | "
-            f"{fmt_delta(row.get(string_delta))} | {fmt_delta(row.get(module_delta))} | "
-            f"{row.get('notes', '-')} |"
+            f"{fmt_delta_cell(row, string_delta, module_delta)} |"
         )
+
+
+def compare_operation_label(row: dict[str, Any]) -> str:
+    label = markdown_escape(row.get("workload", "-"))
+    details = []
+    dataset = row.get("dataset", "-")
+    groups = row.get("target_groups", "-")
+    story = row.get("story", "-")
+    if dataset and dataset != "-":
+        details.append(f"dataset: {markdown_escape(dataset)}")
+    if groups and groups != "-":
+        details.append(f"groups: {markdown_escape(groups)}")
+    if story and story not in ("-", row.get("category", "-")):
+        details.append(f"story: {markdown_escape(story)}")
+    if details:
+        label += f"<br><sub>{' / '.join(details)}</sub>"
+    return label
+
+
+def fmt_performance_cell(row: dict[str, Any], label: str) -> str:
+    value = row.get(label)
+    if not isinstance(value, (int, float)):
+        return fmt_any(value)
+    unit = "ms" if row.get("metric") == "elapsed_ms" else "us"
+    stdev = row.get(f"{label}_time_per_op_stdev_us")
+    if unit == "us" and isinstance(stdev, (int, float)):
+        return f"{fmt_any(value)} +/- {fmt_any(stdev)} {unit}"
+    return f"{fmt_any(value)} {unit}"
+
+
+def fmt_delta_cell(row: dict[str, Any], string_delta: str, module_delta: str) -> str:
+    parts = []
+    if row.get(string_delta) is not None:
+        parts.append(f"{fmt_delta(row.get(string_delta))}% vs string")
+    if row.get(module_delta) is not None:
+        parts.append(f"{fmt_delta(row.get(module_delta))}% vs module")
+    return "<br>".join(parts) if parts else "-"
 
 
 def write_compare_csv(path: Path, rows: list[dict[str, Any]]) -> None:

@@ -43,8 +43,9 @@ For publishable comparisons, enter full commit SHAs for `baseline_redis_ref`,
 `core_redis_ref`, `module_host_redis_ref`, and `redis_roaring_ref` instead of
 branch names. Branch refs are still useful for local or exploratory runs, but
 the uploaded `runner.txt` records both the requested inputs and the resolved
-checkouts. The compare JSON and Markdown also include each Redis run's actual
-`source_sha`, plus `module_sha` for the redis-roaring module run.
+checkouts. The compare JSON includes each Redis run's actual `source_sha`,
+plus `module_sha` for the redis-roaring module run. The compare Markdown links
+the run labels to the resolved commits and links the module commit when present.
 
 The workflow uploads JSON, CSV, Markdown, and runner metadata artifacts under
 `bitmap-bench-results`.
@@ -107,10 +108,12 @@ positive means lower `time_per_op_us` for command rows and lower `elapsed_ms`
 for persistence rows. The published Markdown table focuses on Redis string,
 Redis core Roaring, and redis-roaring module columns; unsupported module rows
 are marked `N/A`. The optional `redis_pr_legacy` guardrail remains available in
-JSON and CSV.
+JSON and CSV. The Markdown keeps the human-facing tables compact by folding
+dataset, group, and story context into the operation cell; JSON and CSV retain
+the expanded columns for analysis.
 
 The compare Markdown is split into first-class performance, memory, and
-serialized-payload sections. Dataset metadata includes bitcount, max set
+serialized-payload-size sections. Dataset metadata includes bitcount, max set
 offset, logical byte length, and density so sparse small-set rows are not mixed
 with dense bitset rows without context.
 
