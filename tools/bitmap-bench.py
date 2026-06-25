@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import platform
 import re
@@ -627,6 +628,9 @@ class RedisBitmapBench:
             "runner_name": os.environ.get("RUNNER_NAME", "local"),
             "runner_os": os.environ.get("RUNNER_OS", platform.system()),
             "runner_arch": os.environ.get("RUNNER_ARCH", platform.machine()),
+            "github_repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "github_server_url": os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
             "github_sha": os.environ.get("GITHUB_SHA", ""),
             "source_sha": self.git_sha_for_src_dir(),
             "source_repo_url": self.git_remote_for_src_dir(),
@@ -1865,6 +1869,23 @@ def markdown_commit_link(label: str, repo_url: str, sha: str) -> str:
     return label
 
 
+def github_run_url(env: dict[str, Any]) -> str:
+    repository = env.get("github_repository", "")
+    run_id = env.get("github_run_id", "")
+    if not repository or not run_id:
+        return ""
+    server_url = env.get("github_server_url", "https://github.com").rstrip("/")
+    return f"{server_url}/{repository}/actions/runs/{run_id}"
+
+
+def markdown_runner_link(env: dict[str, Any]) -> str:
+    runner = markdown_escape(env.get("runner_name", "local"))
+    url = github_run_url(env)
+    if url:
+        return f"[{runner}]({url})"
+    return runner
+
+
 def to_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
@@ -2207,7 +2228,11 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
         "| Run | Mode | Module | Runner |",
         "| --- | --- | --- | --- |",
     ]
-    for payload in payloads:
+    markdown_payloads = [
+        payload for payload in payloads
+        if payload.get("mode_label", payload.get("mode", "run")) in COMPARE_LABELS
+    ]
+    for payload in markdown_payloads:
         env = payload.get("environment", {})
         run_link = markdown_commit_link(
             payload.get("mode_label", "-"),
@@ -2224,7 +2249,7 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
         lines.append(
             f"| {run_link} | {payload.get('mode', '-')} | "
             f"{module_link} | "
-            f"{env.get('runner_name', 'local')} |"
+            f"{markdown_runner_link(env)} |"
         )
 
     lines.extend(["", "Delta columns are positive when Redis core Roaring is better."])
@@ -2244,8 +2269,8 @@ def compare_markdown_lines(rows: list[dict[str, Any]], payloads: list[dict[str, 
         append_resource_compare(
             lines,
             rows,
-            title="Serialized Payload Size",
-            description="Serialized payload size is the byte count of Redis DUMP/RDB/AOF-style payloads where a workload records one; lower is better.",
+            title="Storage",
+            description="Storage is the serialized byte size recorded by Redis DUMP/RDB/AOF-style payload workloads; lower is better.",
             field_suffix="payload_bytes",
             string_delta="payload_core_vs_string_percent",
             module_delta="payload_core_vs_module_percent",
@@ -2323,8 +2348,28 @@ def fmt_performance_cell(row: dict[str, Any], label: str) -> str:
     unit = "ms" if row.get("metric") == "elapsed_ms" else "us"
     stdev = row.get(f"{label}_time_per_op_stdev_us")
     if unit == "us" and isinstance(stdev, (int, float)):
-        return f"{fmt_any(value)} +/- {fmt_any(stdev)} {unit}"
+        rounded_value, rounded_stdev = fmt_value_with_uncertainty(value, stdev)
+        return f"{rounded_value} +/- {rounded_stdev} {unit}"
     return f"{fmt_any(value)} {unit}"
+
+
+def fmt_value_with_uncertainty(value: float, uncertainty: float) -> tuple[str, str]:
+    if uncertainty == 0 or not math.isfinite(uncertainty):
+        return fmt_any(value), fmt_any(uncertainty)
+    decimals = uncertainty_decimal_places(abs(uncertainty), significant_digits=2)
+    return format_rounded_number(value, decimals), format_rounded_number(uncertainty, decimals)
+
+
+def uncertainty_decimal_places(uncertainty: float, significant_digits: int) -> int:
+    magnitude = math.floor(math.log10(uncertainty))
+    return significant_digits - 1 - magnitude
+
+
+def format_rounded_number(value: float, decimals: int) -> str:
+    rounded = round(value, decimals)
+    if decimals > 0:
+        return f"{rounded:.{decimals}f}"
+    return f"{rounded:.0f}"
 
 
 def fmt_delta_cell(row: dict[str, Any], string_delta: str, module_delta: str) -> str:

@@ -108,12 +108,13 @@ positive means lower `time_per_op_us` for command rows and lower `elapsed_ms`
 for persistence rows. The published Markdown table focuses on Redis string,
 Redis core Roaring, and redis-roaring module columns; unsupported module rows
 are marked `N/A`. The optional `redis_pr_legacy` guardrail remains available in
-JSON and CSV. The Markdown keeps the human-facing tables compact by folding
-dataset, group, and story context into the operation cell; JSON and CSV retain
-the expanded columns for analysis.
+JSON and CSV but is omitted from the Markdown run table so the rendered report
+shows the three primary comparison targets. The Markdown keeps the human-facing
+tables compact by folding dataset, group, and story context into the operation
+cell; JSON and CSV retain the expanded columns for analysis.
 
 The compare Markdown is split into first-class performance, memory, and
-serialized-payload-size sections. Dataset metadata includes bitcount, max set
+storage sections. Dataset metadata includes bitcount, max set
 offset, logical byte length, and density so sparse small-set rows are not mixed
 with dense bitset rows without context.
 
