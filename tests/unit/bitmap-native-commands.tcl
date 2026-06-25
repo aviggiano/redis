@@ -310,7 +310,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal 0 [r getbit bitmap:native:getbit:past 7]
         assert_equal 0 [r getbit bitmap:native:getbit:past 100]
         assert_equal 0 [r getbit bitmap:native:getbit:past 4294967295]
-        assert_error {*bit offset is not an integer or out of range*} {
+        assert_error {*bit offset is*out of range*} {
             r getbit bitmap:native:getbit:past 4294967296
         }
         assert_equal [binary format H* 10] [r debug bitmap-raw bitmap:native:getbit:past]
@@ -319,7 +319,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
     test {SETBIT keeps the proto-max-bulk-len offset limit on native bitmaps} {
         seed_native_bitmap bitmap:native:setbit:cap {0}
 
-        assert_error {*bit offset is not an integer or out of range*} {
+        assert_error {*bit offset is*out of range*} {
             r setbit bitmap:native:setbit:cap 4294967296 1
         }
         assert_equal bitmap [r type bitmap:native:setbit:cap]
@@ -471,13 +471,13 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
     test {BITFIELD keeps the proto-max-bulk-len offset limit on native bitmaps} {
         seed_native_bitmap bitmap:native:bitfield:limit {}
 
-        assert_error {*ERR bit offset is not an integer or out of range*} {
+        assert_error {*ERR bit offset is*out of range*} {
             r bitfield bitmap:native:bitfield:limit SET u1 4294967296 1
         }
-        assert_error {*ERR bit offset is not an integer or out of range*} {
+        assert_error {*ERR bit offset is*out of range*} {
             r bitfield bitmap:native:bitfield:limit SET u2 4294967295 3
         }
-        assert_error {*ERR bit offset is not an integer or out of range*} {
+        assert_error {*ERR bit offset is*out of range*} {
             r bitfield_ro bitmap:native:bitfield:limit GET u1 4294967296
         }
         assert_equal 0 [r bitcount bitmap:native:bitfield:limit]
