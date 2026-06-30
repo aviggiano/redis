@@ -92,7 +92,7 @@ jobs:
           echo "REDIS_ROARING_MODULE=$module_path" >> "$GITHUB_ENV"
       - name: Run redis-roaring migrator integration
         run: |
-          python3 -m py_compile tools/redis-bitmap-migrate.py tests/integration/redis-bitmap-migrate.py
+          python3 -m py_compile utils/redis-bitmap-migrate.py tests/integration/redis-bitmap-migrate.py
           mkdir -p "$RUNNER_TEMP/croaring-realdata"
           REDIS_SERVER="$GITHUB_WORKSPACE/src/redis-server" \
           REDIS_ROARING_MODULE="$REDIS_ROARING_MODULE" \

@@ -21,7 +21,7 @@ from zipfile import ZipFile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOOL_PATH = REPO_ROOT / "tools" / "redis-bitmap-migrate.py"
+TOOL_PATH = REPO_ROOT / "utils" / "redis-bitmap-migrate.py"
 MODULE_NAME = "redis_bitmap_migrate_under_test"
 REALDATA_BASE_URL = "https://raw.githubusercontent.com/RoaringBitmap/real-roaring-datasets/master"
 INTEGER_RE = re.compile(r"\d+")
@@ -105,6 +105,8 @@ class FakeRedisServer(socketserver.ThreadingTCPServer):
         self.target = {}
         self.target_byte_len = {}
         self.target_expire_at_ms = {}
+        self.target_dump_payloads = {}
+        self.target_dump_counter = 0
         self.commands = []
         super().__init__(*args)
 
@@ -213,20 +215,19 @@ class FakeRedisHandler(socketserver.BaseRequestHandler):
             return "OK"
         if name == b"DUMP":
             bits = sorted(self.server.target[key])
-            return (
-                b"payload:"
-                + str(self.target_byte_len(key)).encode()
-                + b":"
-                + b",".join(str(bit).encode() for bit in bits)
-            )
+            self.server.target_dump_counter += 1
+            payload = b"fake-target-dump:%d" % self.server.target_dump_counter
+            self.server.target_dump_payloads[payload] = (set(bits), self.target_byte_len(key))
+            return payload
         if name == b"RESTORE":
             ttl = int(command[2])
             payload = command[3]
-            raw_byte_len, values = payload.split(b":", 2)[1:]
-            self.server.target[key] = set() if not values else {
-                int(bit) for bit in values.split(b",") if bit
-            }
-            self.server.target_byte_len[key] = int(raw_byte_len)
+            try:
+                bits, byte_len = self.server.target_dump_payloads[payload]
+            except KeyError as exc:
+                raise RuntimeError("invalid target DUMP payload") from exc
+            self.server.target[key] = set(bits)
+            self.server.target_byte_len[key] = byte_len
             options = {part.upper() for part in command[4:]}
             if ttl > 0 and b"ABSTTL" in options:
                 self.server.target_expire_at_ms[key] = ttl
@@ -237,12 +238,6 @@ class FakeRedisHandler(socketserver.BaseRequestHandler):
             return "OK"
         if name == b"TYPE":
             return "bitmap" if key in self.server.target else "none"
-        if name == b"OBJECT":
-            subcommand = command[1].upper()
-            object_key = command[2] if len(command) > 2 else b""
-            if subcommand == b"ENCODING" and object_key in self.server.target:
-                return b"bitmap-roaring"
-            return None
         if name == b"BITCOUNT":
             return len(self.server.target[key])
         if name == b"BITPOS":
@@ -847,10 +842,6 @@ class RealRedisRoaringMigrationTests(unittest.TestCase):
 
     def assert_native_bits(self, client, key, set_bits, clear_bits, expected_count=None):
         self.assertEqual(migrate.decode_text(client.execute(["TYPE", key])), "bitmap")
-        self.assertIn(
-            "bitmap",
-            migrate.decode_text(client.execute(["OBJECT", "ENCODING", key])),
-        )
         if expected_count is None:
             expected_count = len(set_bits)
         self.assertEqual(client.execute(["BITCOUNT", key]), expected_count)

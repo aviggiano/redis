@@ -67,7 +67,7 @@ marked pending in the trackers.
   before atomic rename or replacement, TTL and DB preservation, and explicit
   above-cap policy defaulting to `fail`. Offline RDB transcoding is deferred as
   a possible future expert mode. The implementation is
-  `tools/redis-bitmap-migrate.py`; see `docs/redis-roaring-migration-contract.md`.
+  `utils/redis-bitmap-migrate.py`; see `docs/redis-roaring-migration-contract.md`.
 
 The determinism invariant is unchanged and now covers the new paths: type
 transitions always reach replicas and the AOF as explicit RESTOREs of the
@@ -315,7 +315,7 @@ work here is auditing the surfaces that bypass or sidestep plain type checks.
 - Keep redis-roaring migration tooling separate from Redis core. The v1
   contract is the external streaming migrator documented in
   `docs/redis-roaring-migration-contract.md` and implemented in
-  `tools/redis-bitmap-migrate.py`; Redis core must not add legacy `reroaring` /
+  `utils/redis-bitmap-migrate.py`; Redis core must not add legacy `reroaring` /
   `roaring64` payload loading or `R.*` / `R64.*` compatibility prefixes.
 - Use the redis-roaring command inventory in
   `docs/redis-roaring-native-bitmap-design.md` to keep v1 Redis command scope

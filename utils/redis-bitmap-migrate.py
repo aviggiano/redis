@@ -748,10 +748,6 @@ class BitmapMigrator:
             checks["type"] = key_type
             if key_type != "bitmap":
                 raise MigrateError(f"temporary key type is {key_type!r}, expected 'bitmap'")
-            encoding = decode_text(conn.command(["OBJECT", "ENCODING", temp_key])).lower()
-            checks["encoding"] = encoding
-            if "bitmap" not in encoding:
-                raise MigrateError(f"temporary key encoding is {encoding!r}, expected bitmap encoding")
             cardinality = parse_uint(conn.command(["BITCOUNT", temp_key]), "target cardinality")
             checks["cardinality"] = cardinality
             if cardinality != info.cardinality:

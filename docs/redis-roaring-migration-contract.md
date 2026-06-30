@@ -7,7 +7,7 @@ use an external streaming migrator, for example `redis-bitmap-migrate`, as the
 intended path from `aviggiano/redis-roaring` deployments to Redis native bitmap
 values. Treat this as provisional until the tracker records the final decision.
 
-This repository provides that v1 tool as `tools/redis-bitmap-migrate.py`.
+This repository provides that v1 tool as `utils/redis-bitmap-migrate.py`.
 
 Proposal A is the v1 contract. Proposal B, an offline RDB transcoder, remains a
 possible future expert mode. Bridge modules and core legacy RDB loaders are out
@@ -30,7 +30,7 @@ native bitmap values, validating them, and committing them safely.
 The tool defaults to a dry run and writes a durable JSON manifest:
 
 ```
-tools/redis-bitmap-migrate.py \
+utils/redis-bitmap-migrate.py \
   --source-host 127.0.0.1 --source-port 6379 \
   --target-host 127.0.0.1 --target-port 6380 \
   --manifest redis-bitmap-migrate-manifest.json
@@ -40,7 +40,7 @@ To perform writes, run it during a maintenance window or another verified final
 pass and acknowledge that source writes are frozen:
 
 ```
-tools/redis-bitmap-migrate.py \
+utils/redis-bitmap-migrate.py \
   --source-host 127.0.0.1 --source-port 6379 \
   --target-host 127.0.0.1 --target-port 6380 \
   --manifest redis-bitmap-migrate-manifest.json \
