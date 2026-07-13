@@ -844,12 +844,11 @@ static kvobj *lookupStringForBitCommand(client *c, uint64_t maxbit,
 
     if (o == NULL) {
         o = createObject(OBJ_STRING,sdsnewlen(NULL, byte+1));
-        dbAddByLink(c->db,c->argv[1],&o,&link);
         *created = 1;
         *strGrowSize = byte + 1;
         *strOldSize = 0;
     } else {
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        o = dbUnshareStringValueByLink(c->db,c->argv[1],o,link);
         *strOldSize  = sdslen(o->ptr);
         *created = 0;
         if (server.memory_tracking_enabled)
@@ -914,6 +913,41 @@ static robj *bitmapObjectFromStringObject(robj *o) {
     return bitmap;
 }
 
+/* Return the propagation destinations still permitted for this command.
+ * Module clients carry the RedisModule_Call A/R exclusions in addition to
+ * the usual per-command prevent flags. Compute this before replacing the
+ * triggering command with preventCommandPropagation(). */
+static int bitmapPropagationTarget(client *c) {
+    int target = PROPAGATE_AOF | PROPAGATE_REPL;
+
+    if (c->flags & (CLIENT_PREVENT_AOF_PROP |
+                    CLIENT_MODULE_PREVENT_AOF_PROP))
+        target &= ~PROPAGATE_AOF;
+    if (c->flags & (CLIENT_PREVENT_REPL_PROP |
+                    CLIENT_MODULE_PREVENT_REPL_PROP))
+        target &= ~PROPAGATE_REPL;
+
+    return target;
+}
+
+/* A NEW notification is synchronous, and a module callback may propagate a
+ * write that deletes or replaces the key. Normally the triggering command is
+ * propagated only after it returns, which would reverse the actual execution
+ * order on replicas and during AOF replay. When a NEW callback can run, queue
+ * the unchanged triggering command before dispatch and suppress its normal
+ * tail propagation. Native representation transitions use RESTORE for the
+ * same ordering reason in bitmapPropagateRestore() below. */
+static void bitmapPropagateCommandBeforeNewNotification(client *c) {
+    if (mustObeyClient(c) ||
+        !moduleHasSubscribersForKeyspaceEvent(NOTIFY_NEW))
+        return;
+
+    int target = bitmapPropagationTarget(c);
+    preventCommandPropagation(c);
+    if (!shouldPropagateCommand(target)) return;
+    alsoPropagate(c->db->id, c->argv, c->argc, target);
+}
+
 /* Propagate a bitmap representation transition as RESTORE ... REPLACE
  * [ABSTTL] [KEEPMETADATA] instead of the triggering command: the conversion
  * decision must stay a pure function of replicated logical state, never
@@ -932,13 +966,14 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     robj *argv[7];
     int has_expire = expire != -1;
     int argc = 5;
+    int target = bitmapPropagationTarget(c);
 
     /* The representation transition must suppress the original command even
      * when there is currently no AOF, replica, backlog or migration consumer.
      * Avoid serializing a payload in that common case: for a sparse bitmap its
      * logical length may be hundreds of MiB despite tiny resident memory. */
     preventCommandPropagation(c);
-    if (!shouldPropagateCommand(PROPAGATE_AOF | PROPAGATE_REPL)) return;
+    if (!shouldPropagateCommand(target)) return;
 
     createDumpPayload(&payload, bitmap, key, c->db->id, 0);
 
@@ -952,7 +987,7 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     if (keepmetadata)
         argv[argc++] = createStringObject("KEEPMETADATA", 12);
 
-    alsoPropagate(c->db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL);
+    alsoPropagate(c->db->id, argv, argc, target);
 
     decrRefCount(argv[0]);
     if (has_expire) decrRefCount(argv[2]);
@@ -1153,8 +1188,8 @@ void setbitCommand(client *c) {
         ((uint8_t*)o->ptr)[byte] = byteval;
 
         /* If this is not a new key and size changed, then update the keysizes
-         * histogram. Otherwise, the histogram already updated in
-         * lookupStringForBitCommand() by calling dbAdd(). Two deliberate
+         * histogram. A new value is added below only after its final contents
+         * are ready, so dbAdd() accounts its final size. Two deliberate
          * differences from the upstream shape of this block, both caught by
          * kvsUpdateHistogram's non-negative bin assert (see
          * aviggiano/redis#168): the guard is "not created" rather than "old
@@ -1164,6 +1199,15 @@ void setbitCommand(client *c) {
          * key and decrement the new-size bin. */
         if (!created && strGrowSize != 0)
             updateKeysizesHist(c->db, OBJ_STRING, strOldSize, strOldSize + strGrowSize);
+
+        /* Emit "new" only after the value is complete. A synchronous module
+         * callback may delete or replace it, so refresh the pointer before it
+         * is passed to keyModified() and never reuse the insertion link. */
+        if (created) {
+            bitmapPropagateCommandBeforeNewNotification(c);
+            dbAddByLink(c->db, c->argv[1], &o, &link);
+            o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOEFFECTS);
+        }
 
         keyModified(c,c->db,c->argv[1],o,1);
         notifyKeyspaceEvent(NOTIFY_STRING,"setbit",c->argv[1],c->db->id);
@@ -2662,6 +2706,15 @@ void bitfieldGeneric(client *c, int flags) {
         }
     }
 
+    /* Like SETBIT, finish a newly created string before emitting "new". The
+     * callback is synchronous and may replace or delete the key, so refresh
+     * the value used by keyModified() after dbAddByLink(). */
+    if (string_created) {
+        bitmapPropagateCommandBeforeNewNotification(c);
+        dbAddByLink(c->db, c->argv[1], &o, &native_bitmap_link);
+        o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOEFFECTS);
+    }
+
     int string_len_extended = !native_bitmap_write && strGrowSize != 0;
 
     if (changes || native_len_extended || string_len_extended || native_transition) {
@@ -2672,11 +2725,10 @@ void bitfieldGeneric(client *c, int flags) {
                 updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o,
                                     oldAllocSize, kvobjAllocSize(o));
         } else if (!native_transition) {
-            /* If this is not a new key and size changed, then update the
-             * keysizes histogram. Otherwise, the histogram already updated
-             * in lookupStringForBitCommand() by calling dbAdd(). "Not
-             * created" rather than "old size not 0": see the same guard in
-             * setbitCommand() and aviggiano/redis#168. */
+            /* If this is not a new key and size changed, update the keysizes
+             * histogram. Newly created values were added at their final size
+             * above. "Not created" rather than "old size not 0": see the
+             * same guard in setbitCommand() and aviggiano/redis#168. */
             if (!string_created && strGrowSize != 0)
                 updateKeysizesHist(c->db, OBJ_STRING, strOldSize, strOldSize + strGrowSize);
         }

@@ -445,8 +445,9 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
 
     /* Finish accounting and expose the installed value before notifying
      * "new" observers. Module notification callbacks execute synchronously
-     * and may delete or replace the key, so no code after the callback may
-     * dereference the original kvobj. */
+     * and may delete, replace, or reallocate the key, so this function does
+     * not dereference kv after the callback. A caller that deliberately
+     * supports such callbacks must re-fetch the key before using it again. */
     updateKeysizesHist(db, kv->type, -1, getObjectLength(kv)); /* add hist */
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(db, slot, kv, -1, kvobjAllocSize(kv));
@@ -775,6 +776,11 @@ void setKeyByLink(client *c, redisDb *db, robj *key, robj **valref, int flags, d
         exists = oldval != NULL;
     }
 
+    int notification_mask = exists ?
+        (NOTIFY_OVERWRITTEN | NOTIFY_TYPE_CHANGED) : NOTIFY_NEW;
+    int has_mutating_ksn_subscribers =
+        moduleHasSubscribersForKeyspaceEvent(notification_mask);
+
     if (exists) {
         int oldtype = oldval->type;
         int newtype = (*valref)->type;
@@ -793,10 +799,12 @@ void setKeyByLink(client *c, redisDb *db, robj *key, robj **valref, int flags, d
 
     /* Signal key modification and update LRM timestamp. Module subscribers of
      * the notifications above can synchronously delete or replace the key.
-     * Only pay for a no-effects lookup when such subscribers exist, and never
-     * dereference the caller's potentially stale replacement pointer. */
+     * Subscriber presence was captured before dispatch so the decision
+     * describes callbacks that could have run, rather than the subscriber
+     * state they leave behind. Only pay for a no-effects lookup when needed,
+     * and never dereference a potentially stale pointer. */
     robj *val = *valref;
-    if (moduleHasSubscribersForKeyspaceEvent(NOTIFY_NEW | NOTIFY_OVERWRITTEN | NOTIFY_TYPE_CHANGED))
+    if (has_mutating_ksn_subscribers)
         val = lookupKeyReadWithFlags(db, key, LOOKUP_NOEFFECTS);
     keyModified(c,db,key,val,!(flags & SETKEY_NO_SIGNAL));
 }

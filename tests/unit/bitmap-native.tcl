@@ -1700,8 +1700,34 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "modules" "external:skip" "c
         $master config set bitmap-default-native yes
         $replica config set bitmap-default-native no
 
+        test {SETBIT string creation survives new notification deletion} {
+            set key bitmap:notify-race:setbit-string-new
+            $master config set bitmap-default-native no
+            $master del $key
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key new del
+            assert_equal 0 [$master setbit $key $::sparse_public_offset 1]
+            assert_bitmap_notify_no_key $master $replica $key
+            $master config set bitmap-default-native yes
+        }
+
+        test {BITFIELD string creation survives new notification replacement} {
+            set key bitmap:notify-race:bitfield-string-new
+            set value module-overwrote-bitfield-string-new
+            $master config set bitmap-default-native no
+            $master del $key
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key new set $value
+            assert_equal {0} [$master bitfield $key SET u1 $::sparse_public_offset 1]
+            assert_bitmap_notify_string $master $replica $key $value
+            $master config set bitmap-default-native yes
+        }
+
         test {SETBIT native creation survives new notification deletion} {
             set key bitmap:notify-race:setbit-new
+            $master config set bitmap-default-native yes
             $master del $key
             wait_for_ofs_sync $master $replica
 
@@ -1767,6 +1793,20 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "modules" "external:skip" "c
             assert_equal OK [$master bitmap convert $key NATIVE]
             assert_bitmap_notify_no_key $master $replica $key
         }
+
+        test {BITMAP CONVERT rollback survives type_changed notification replacement} {
+            set key bitmap:notify-race:explicit-rollback
+            set value module-overwrote-explicit-rollback
+            $master del $key
+            $master setbit $key $::sparse_public_offset 1
+            wait_for_ofs_sync $master $replica
+            assert_equal bitmap [$master type $key]
+
+            arm_bitmap_notify $master $key type_changed set $value
+            assert_equal OK [$master bitmap convert $key STRING]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
     }
 }
 

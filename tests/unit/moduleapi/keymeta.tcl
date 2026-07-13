@@ -99,7 +99,7 @@ proc flushallAndVerifyCleanup {} {
     assert_equal [r keymeta.active] 0
 }
 
-start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-debug-command yes}} {
+start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-debug-command yes save {}}} {
     r module load $testmodule
     r debug enable-keymeta-runtime-registration 1
 
@@ -150,14 +150,21 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     }
 
     test {KEYMETA - BITMAP CONVERT preserves metadata in both directions} {
+        assert_equal no [lindex [r config get appendonly] 1]
+        assert_equal no [lindex [r config get cluster-enabled] 1]
+        assert_equal 0 [s connected_slaves]
+        assert_equal 0 [s repl_backlog_active]
+
         set key bitmap:meta:explicit
         set raw [binary format H* 80400100080000]
         r set $key $raw
         setupKeyMeta $key 7 1 0
         set expire_at [r pexpiretime $key]
+        set rdb_save_count [r keymeta.rdbsavecount]
 
         foreach representation {NATIVE STRING} {
             assert_equal OK [r bitmap convert $key $representation]
+            assert_equal $rdb_save_count [r keymeta.rdbsavecount]
             assert_equal $expire_at [r pexpiretime $key]
             for {set cid 1} {$cid <= 7} {incr cid} {
                 assert_equal "meta$cid" [r keymeta.get [cname $cid] $key]
@@ -165,6 +172,11 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
         }
         assert_equal string [r type $key]
         assert_equal $raw [r get $key]
+
+        # Positive control: DUMP must exercise every serializable metadata
+        # class, proving that the counter detects createDumpPayload().
+        r dump $key
+        assert_equal [expr {$rdb_save_count + 7}] [r keymeta.rdbsavecount]
         flushallAndVerifyCleanup
     }
 

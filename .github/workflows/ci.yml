@@ -2,6 +2,9 @@ name: CI
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.head_ref || github.ref }}
   cancel-in-progress: true
@@ -38,6 +41,43 @@ jobs:
         run: sudo apt-get install tcl8.6 tclx -y
       - name: test
         run: ./runtest --verbose --tags -slow --dump-logs
+
+  test-redis-roaring-coexistence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake tcl8.6 tclx
+      - name: Checkout pinned redis-roaring
+        env:
+          REDIS_ROARING_SHA: d56bd7ce1390a0ecab6dc2b0563ec041c741efc4
+        run: |
+          git init redis-roaring
+          git -C redis-roaring remote add origin https://github.com/aviggiano/redis-roaring.git
+          git -C redis-roaring fetch --depth 1 origin "$REDIS_ROARING_SHA"
+          git -C redis-roaring checkout --detach FETCH_HEAD
+          test "$(git -C redis-roaring rev-parse HEAD)" = "$REDIS_ROARING_SHA"
+          git -C redis-roaring submodule update --init --depth 1 deps/CRoaring deps/hiredis
+      - name: Build Redis with ASan and forced defrag
+        run: make SANITIZER=address DEBUG_DEFRAG=force REDIS_CFLAGS='-Werror -DDEBUG_ASSERTIONS -DREDIS_TEST'
+      - name: Build independently linked redis-roaring module
+        run: |
+          (cd redis-roaring/src && ../deps/CRoaring/amalgamation.sh)
+          cmake -S redis-roaring -B redis-roaring/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_TESTS=ON \
+            -DENABLE_ROARING_TESTS=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DUSE_REDIS_ALLOCATOR=ON
+          cmake --build redis-roaring/build --target redis-roaring --parallel "$(nproc)"
+          test -f redis-roaring/build/libredis-roaring.so
+      - name: Test CRoaring allocator and symbol coexistence
+        env:
+          REDIS_ROARING_MODULE: ${{ github.workspace }}/redis-roaring/build/libredis-roaring.so
+        run: ./runtest --single unit/bitmap-native --debug-defrag --verbose --dump-logs --clients 1
 
   build-debian-old:
     runs-on: ubuntu-latest

@@ -78,6 +78,9 @@ static const char* lookupClassName(RedisModuleKeyMetaClassId class_id) {
 /* Track active metadata instances (not yet freed) */
 static long long active_metadata_count = 0;
 
+/* Track RDB save callback invocations for serialization-path tests. */
+static long long rdb_save_callback_count = 0;
+
 /* Helper functions for class mapping */
 
 /* Add a mapping from 4-char-id to class-id */
@@ -179,6 +182,8 @@ static int KeyMetaMoveDiscardCallback(RedisModuleKeyOptCtx *ctx, uint64_t *meta)
  */
 static void KeyMetaRDBSaveCallback(RedisModuleIO *rdb, void *reserved, uint64_t *meta) {
     REDISMODULE_NOT_USED(reserved);
+
+    rdb_save_callback_count++;
 
     /* If metadata is NULL (reset_value), don't save anything */
     if (*meta == 0) return;
@@ -539,6 +544,18 @@ static int KeyMetaActive_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **a
     return REDISMODULE_OK;
 }
 
+/* KEYMETA.RDBSAVECOUNT
+ * Returns the number of times the metadata RDB save callback was invoked. */
+static int KeyMetaRDBSaveCount_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc != 1) {
+        return RedisModule_WrongArity(ctx);
+    }
+    REDISMODULE_NOT_USED(argv);
+
+    RedisModule_ReplyWithLongLong(ctx, rdb_save_callback_count);
+    return REDISMODULE_OK;
+}
+
 /* Module initialization */
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
@@ -571,6 +588,11 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx, "keymeta.active",
         KeyMetaActive_RedisCommand, "readonly fast", 0, 0, 0) == REDISMODULE_ERR) {
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_CreateCommand(ctx, "keymeta.rdbsavecount",
+        KeyMetaRDBSaveCount_RedisCommand, "readonly fast", 0, 0, 0) == REDISMODULE_ERR) {
         return REDISMODULE_ERR;
     }
 

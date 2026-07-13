@@ -7165,6 +7165,17 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         if (!(flags & REDISMODULE_ARGV_NO_REPLICAS))
             call_flags |= CMD_CALL_PROPAGATE_REPL;
     }
+
+    /* Commands may replace their normal propagation with an explicit
+     * alsoPropagate() sequence. Make the RM_Call target available while the
+     * command runs so those implementations can honor the A/R modifiers too.
+     * The flags must also survive for a blocking command that is reprocessed
+     * after RM_Call returns. */
+    if (!(call_flags & CMD_CALL_PROPAGATE_AOF))
+        c->flags |= CLIENT_MODULE_PREVENT_AOF_PROP;
+    if (!(call_flags & CMD_CALL_PROPAGATE_REPL))
+        c->flags |= CLIENT_MODULE_PREVENT_REPL_PROP;
+
     call(c,call_flags);
     server.replication_allowed = prev_replication_allowed;
 
@@ -7184,14 +7195,6 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         };
         reply = callReplyCreatePromise(promise);
         c->bstate.async_rm_call_handle = promise;
-        if (!(call_flags & CMD_CALL_PROPAGATE_AOF)) {
-            /* No need for AOF propagation, set the relevant flags of the client */
-            c->flags |= CLIENT_MODULE_PREVENT_AOF_PROP;
-        }
-        if (!(call_flags & CMD_CALL_PROPAGATE_REPL)) {
-            /* No need for replication propagation, set the relevant flags of the client */
-            c->flags |= CLIENT_MODULE_PREVENT_REPL_PROP;
-        }
         c = NULL; /* Make sure not to free the client */
     } else {
         reply = moduleParseReply(c, (ctx->flags & REDISMODULE_CTX_AUTO_MEMORY) ? ctx : NULL);

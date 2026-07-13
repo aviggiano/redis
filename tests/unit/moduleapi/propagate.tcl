@@ -767,6 +767,81 @@ tags "modules aof external:skip" {
     }
 }
 
+tags "modules bitmap bitmap-native repl external:skip cluster:skip" {
+    test {Bitmap replacement propagation honors RM_Call replica exclusions} {
+        start_server {} {
+            set replica [srv 0 client]
+            start_server [list overrides [list loadmodule "$miscmodule"]] {
+                set master [srv 0 client]
+                set master_host [srv 0 host]
+                set master_port [srv 0 port]
+                set replica_only bitmap:rm-call:replica-only
+                set aof_only bitmap:rm-call:aof-only
+                set raw [binary format H* f00f]
+
+                $replica replicaof $master_host $master_port
+                wait_for_sync $replica
+
+                $master set $replica_only $raw
+                $master set $aof_only $raw
+                wait_for_ofs_sync $master $replica
+                assert_equal string [$replica type $replica_only]
+                assert_equal string [$replica type $aof_only]
+
+                # A suppresses AOF, leaving replicas as the only target.
+                assert_equal OK [$master test.rm_call_flags !A bitmap \
+                    convert $replica_only NATIVE]
+                wait_for_ofs_sync $master $replica
+                assert_equal bitmap [$master type $replica_only]
+                assert_equal bitmap [$replica type $replica_only]
+                assert_equal $raw [$replica debug bitmap-raw $replica_only]
+
+                # R suppresses replicas. With AOF disabled, the replacement
+                # must remain local and no fallback SETBIT/RESTORE may leak.
+                assert_equal OK [$master test.rm_call_flags !R bitmap \
+                    convert $aof_only NATIVE]
+                assert_equal bitmap [$master type $aof_only]
+                assert_equal string [$replica type $aof_only]
+                assert_equal $raw [$replica get $aof_only]
+            }
+        }
+    }
+}
+
+tags "modules bitmap bitmap-native aof external:skip cluster:skip" {
+    test {Bitmap replacement propagation honors RM_Call AOF exclusions} {
+        start_server [list overrides [list loadmodule "$miscmodule"]] {
+            r config set appendonly yes
+            r config set auto-aof-rewrite-percentage 0
+            waitForBgrewriteaof r
+
+            set replica_only bitmap:rm-call:aof-reload:replica-only
+            set aof_only bitmap:rm-call:aof-reload:aof-only
+            set raw [binary format H* f00f]
+            r set $replica_only $raw
+            r set $aof_only $raw
+
+            assert_equal OK [r test.rm_call_flags !A bitmap \
+                convert $replica_only NATIVE]
+            assert_equal OK [r test.rm_call_flags !R bitmap \
+                convert $aof_only NATIVE]
+            assert_equal bitmap [r type $replica_only]
+            assert_equal bitmap [r type $aof_only]
+
+            r config rewrite
+            restart_server 0 true false
+            wait_done_loading r
+
+            # The replica-only replacement was excluded from AOF; the AOF-only
+            # replacement must be present and retain its native representation.
+            assert_equal string [r type $replica_only]
+            assert_equal $raw [r get $replica_only]
+            assert_equal bitmap [r type $aof_only]
+            assert_equal $raw [r debug bitmap-raw $aof_only]
+        }
+    }
+}
+
 # This test does not really test module functionality, but rather uses a module
 # command to test Redis replication mechanisms.
 test {Replicas that was marked as CLIENT_CLOSE_ASAP should not keep the replication backlog from been trimmed} {
