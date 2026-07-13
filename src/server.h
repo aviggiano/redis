@@ -3743,6 +3743,8 @@ void preventCommandPropagation(client *c);
 int shouldPropagateCommand(int target);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
+int getClientCommandPropagationTarget(client *c);
+void propagateCommandBeforeModuleNotification(client *c, int notification_mask);
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration);
 void updateCommandLatencyHistogram(struct hdr_histogram** latency_histogram, int64_t duration_hist);
 int prepareForShutdown(int flags);
@@ -4079,6 +4081,8 @@ static inline kvobj *dictGetKV(const dictEntry *de) {return (kvobj *) dictGetKey
 kvobj *dbAdd(redisDb *db, robj *key, robj **valref);
 kvobj *dbAddByLink(redisDb *db, robj *key, robj **valref, dictEntryLink *link);
 kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link, const KeyMetaSpec *m);
+kvobj *dbAddInternalNoNotify(redisDb *db, robj *key, robj **valref, dictEntryLink *link, const KeyMetaSpec *m);
+void dbNotifyKeyAdded(redisDb *db, robj *key, int type);
 kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, const KeyMetaSpec *keyMetaSpec);
 void dbReplaceValue(redisDb *db, robj *key, kvobj **ioKeyVal, int updateKeySizes);
 void dbReplaceValueWithLink(redisDb *db, robj *key, robj **val, dictEntryLink link);

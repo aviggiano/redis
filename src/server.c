@@ -3773,6 +3773,39 @@ void preventCommandReplication(client *c) {
     c->flags |= CLIENT_PREVENT_REPL_PROP;
 }
 
+/* Return the propagation destinations still permitted for this command.
+ * Module clients carry RedisModule_Call's A/R exclusions in addition to the
+ * ordinary per-command prevent flags. Call this before replacing the
+ * triggering command with preventCommandPropagation(). */
+int getClientCommandPropagationTarget(client *c) {
+    int target = PROPAGATE_AOF | PROPAGATE_REPL;
+
+    if (c->flags & (CLIENT_PREVENT_AOF_PROP |
+                    CLIENT_MODULE_PREVENT_AOF_PROP))
+        target &= ~PROPAGATE_AOF;
+    if (c->flags & (CLIENT_PREVENT_REPL_PROP |
+                    CLIENT_MODULE_PREVENT_REPL_PROP))
+        target &= ~PROPAGATE_REPL;
+
+    return target;
+}
+
+/* Module keyspace notifications run synchronously and may propagate a write.
+ * Queue the triggering command before any matching callback so replicas and
+ * AOF replay preserve the server's execution order, then suppress normal tail
+ * propagation. Non-module notification consumers cannot mutate the dataset,
+ * so they do not require this ordering path. */
+void propagateCommandBeforeModuleNotification(client *c, int notification_mask) {
+    if (mustObeyClient(c) ||
+        !moduleHasSubscribersForKeyspaceEvent(notification_mask))
+        return;
+
+    int target = getClientCommandPropagationTarget(c);
+    preventCommandPropagation(c);
+    if (!shouldPropagateCommand(target)) return;
+    alsoPropagate(c->db->id, c->argv, c->argc, target);
+}
+
 /* Log the last command a client executed into the slowlog. */
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration) {
     /* Some commands may contain sensitive data that should not be available in the slowlog. */

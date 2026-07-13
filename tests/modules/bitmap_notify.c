@@ -117,6 +117,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         return REDISMODULE_ERR;
 
     if (RedisModule_SubscribeToKeyspaceEvents(ctx,
+            REDISMODULE_NOTIFY_GENERIC |
             REDISMODULE_NOTIFY_NEW |
             REDISMODULE_NOTIFY_OVERWRITTEN |
             REDISMODULE_NOTIFY_TYPE_CHANGED,

@@ -395,7 +395,12 @@ kvobj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     return kv;
 }
 
-/* Add a key-value entry to the DB.
+/* Add a key-value entry to the DB without exposing it to synchronous NEW
+ * notification callbacks. The caller must finish any initialization that
+ * requires a live value pointer, then call dbNotifyKeyAdded() exactly once.
+ * Prefer dbAddInternal() unless two-phase insertion is required.
+ *
+ * Add a key-value entry to the DB.
  *
  * A copy of 'key' is stored in the database. The caller must ensure the
  * `key` is properly freed by calling decrRefcount(key).
@@ -415,8 +420,8 @@ kvobj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  * keymeta - Defines metadata to be attached to the key. Including optional 
  *           expiration and modules metadata to be copied (REQUIRED).
  */
-kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link, 
-                     const KeyMetaSpec *keymeta) 
+kvobj *dbAddInternalNoNotify(redisDb *db, robj *key, robj **valref,
+                            dictEntryLink *link, const KeyMetaSpec *keymeta)
 {
     int slot = getKeySlot(key->ptr);
     dictEntryLink tmp = NULL;
@@ -443,17 +448,32 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
                    keymeta->numMeta * sizeof(uint64_t));
     }
 
-    /* Finish accounting and expose the installed value before notifying
-     * "new" observers. Module notification callbacks execute synchronously
-     * and may delete, replace, or reallocate the key, so this function does
-     * not dereference kv after the callback. A caller that deliberately
-     * supports such callbacks must re-fetch the key before using it again. */
+    /* Finish accounting before exposing the value to synchronous observers. */
     updateKeysizesHist(db, kv->type, -1, getObjectLength(kv)); /* add hist */
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(db, slot, kv, -1, kvobjAllocSize(kv));
     *valref = kv;
-    signalKeyAsReady(db, key, kv->type);
+    return kv;
+}
+
+/* Complete a two-phase insertion from dbAddInternalNoNotify(). Readiness is
+ * signaled only after the value is fully initialized, and before NEW observers
+ * run, matching the ordering of ordinary dbAddInternal() calls. Module
+ * callbacks execute synchronously and may delete, replace, or reallocate the
+ * key, so every value pointer held by the caller must be considered stale when
+ * this function returns. */
+void dbNotifyKeyAdded(redisDb *db, robj *key, int type) {
+    signalKeyAsReady(db, key, type);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
+}
+
+kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref,
+                     dictEntryLink *link, const KeyMetaSpec *keymeta)
+{
+    kvobj *kv = dbAddInternalNoNotify(db, key, valref, link, keymeta);
+    int type = kv->type;
+
+    dbNotifyKeyAdded(db, key, type);
     return kv;
 }
 

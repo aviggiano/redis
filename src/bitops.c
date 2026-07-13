@@ -913,41 +913,6 @@ static robj *bitmapObjectFromStringObject(robj *o) {
     return bitmap;
 }
 
-/* Return the propagation destinations still permitted for this command.
- * Module clients carry the RedisModule_Call A/R exclusions in addition to
- * the usual per-command prevent flags. Compute this before replacing the
- * triggering command with preventCommandPropagation(). */
-static int bitmapPropagationTarget(client *c) {
-    int target = PROPAGATE_AOF | PROPAGATE_REPL;
-
-    if (c->flags & (CLIENT_PREVENT_AOF_PROP |
-                    CLIENT_MODULE_PREVENT_AOF_PROP))
-        target &= ~PROPAGATE_AOF;
-    if (c->flags & (CLIENT_PREVENT_REPL_PROP |
-                    CLIENT_MODULE_PREVENT_REPL_PROP))
-        target &= ~PROPAGATE_REPL;
-
-    return target;
-}
-
-/* A NEW notification is synchronous, and a module callback may propagate a
- * write that deletes or replaces the key. Normally the triggering command is
- * propagated only after it returns, which would reverse the actual execution
- * order on replicas and during AOF replay. When a NEW callback can run, queue
- * the unchanged triggering command before dispatch and suppress its normal
- * tail propagation. Native representation transitions use RESTORE for the
- * same ordering reason in bitmapPropagateRestore() below. */
-static void bitmapPropagateCommandBeforeNewNotification(client *c) {
-    if (mustObeyClient(c) ||
-        !moduleHasSubscribersForKeyspaceEvent(NOTIFY_NEW))
-        return;
-
-    int target = bitmapPropagationTarget(c);
-    preventCommandPropagation(c);
-    if (!shouldPropagateCommand(target)) return;
-    alsoPropagate(c->db->id, c->argv, c->argc, target);
-}
-
 /* Propagate a bitmap representation transition as RESTORE ... REPLACE
  * [ABSTTL] [KEEPMETADATA] instead of the triggering command: the conversion
  * decision must stay a pure function of replicated logical state, never
@@ -966,7 +931,7 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     robj *argv[7];
     int has_expire = expire != -1;
     int argc = 5;
-    int target = bitmapPropagationTarget(c);
+    int target = getClientCommandPropagationTarget(c);
 
     /* The representation transition must suppress the original command even
      * when there is currently no AOF, replica, backlog or migration consumer.
@@ -1204,7 +1169,7 @@ void setbitCommand(client *c) {
          * callback may delete or replace it, so refresh the pointer before it
          * is passed to keyModified() and never reuse the insertion link. */
         if (created) {
-            bitmapPropagateCommandBeforeNewNotification(c);
+            propagateCommandBeforeModuleNotification(c, NOTIFY_NEW);
             dbAddByLink(c->db, c->argv[1], &o, &link);
             o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOEFFECTS);
         }
@@ -1599,14 +1564,29 @@ static void bitopCommandBitmap(client *c, bitmapBitop op, robj *targetkey,
              * payload is queued before setKey() notifications: module
              * subscribers may mutate or delete the key. */
             bitmapPropagateRestore(c, targetkey, res_bitmap, -1, 0);
+        } else {
+            /* Existing native sources make the destination type a replicated
+             * dataset property, so the original BITOP remains the compact
+             * propagation form. Queue it before setKey() dispatches synchronous
+             * destination notifications; a callback write must be replayed
+             * after the BITOP, matching its execution order on this server. */
+            propagateCommandBeforeModuleNotification(c,
+                NOTIFY_NEW | NOTIFY_OVERWRITTEN |
+                NOTIFY_TYPE_CHANGED | NOTIFY_BITMAP);
         }
         setKey(c, c->db, targetkey, &res_bitmap, 0);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_BITMAP,"set",targetkey,c->db->id);
-    } else if (dbDelete(c->db,targetkey)) {
-        keyModified(c,c->db,targetkey,NULL,1);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",targetkey,c->db->id);
-        server.dirty++;
+    } else {
+        /* An empty native source makes BITOP delete its destination. Queue the
+         * command before a synchronous DEL callback can recreate that key. */
+        if (has_native_bitmap)
+            propagateCommandBeforeModuleNotification(c, NOTIFY_GENERIC);
+        if (dbDelete(c->db,targetkey)) {
+            keyModified(c,c->db,targetkey,NULL,1);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",targetkey,c->db->id);
+            server.dirty++;
+        }
     }
     serverAssert(maxlen <= (uint64_t)LLONG_MAX);
     addReplyLongLong(c,(long long)maxlen); /* Return the destination length in bytes. */
@@ -2710,7 +2690,7 @@ void bitfieldGeneric(client *c, int flags) {
      * callback is synchronous and may replace or delete the key, so refresh
      * the value used by keyModified() after dbAddByLink(). */
     if (string_created) {
-        bitmapPropagateCommandBeforeNewNotification(c);
+        propagateCommandBeforeModuleNotification(c, NOTIFY_NEW);
         dbAddByLink(c->db, c->argv[1], &o, &native_bitmap_link);
         o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOEFFECTS);
     }

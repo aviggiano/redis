@@ -324,6 +324,7 @@ void restoreCommand(client *c) {
         if (deleted) {
             robj *aux = server.lazyfree_lazy_server_del ? shared.unlink : shared.del;
             rewriteClientCommandVector(c, 2, aux, key);
+            propagateCommandBeforeModuleNotification(c, NOTIFY_GENERIC);
             keyModified(c,c->db,key,NULL,1);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
             server.dirty++;
@@ -352,8 +353,9 @@ void restoreCommand(client *c) {
         else
             removeExpire(c->db, key);
     } else {
-        /* Create the key and set the TTL if any. */
-        kv = dbAddInternal(c->db, key, &obj, &link, &keymeta);
+        /* Create the key and set the TTL if any, but defer NEW notification
+         * until all type-specific initialization below is complete. */
+        kv = dbAddInternalNoNotify(c->db, key, &obj, &link, &keymeta);
     }
 
     /* Save type: kv may be reallocated by module callbacks during notifyKeyspaceEvent below. */
@@ -380,6 +382,24 @@ void restoreCommand(client *c) {
         }
     }
     objectSetLRUOrLFU(kv, lfu_freq, lru_idle, lru_clock, 1000);
+
+    /* RESTORE's NEW/restore/transition observers may synchronously propagate
+     * another write. Queue the (possibly ABSTTL-rewritten) RESTORE first so
+     * AOF and replicas retain the same execution order. */
+    propagateCommandBeforeModuleNotification(c,
+        NOTIFY_NEW | NOTIFY_GENERIC |
+        NOTIFY_OVERWRITTEN | NOTIFY_TYPE_CHANGED);
+
+    if (!transition) {
+        /* signalKeyAsReady() and NEW observers must see a fully initialized
+         * hash/stream and the requested LRU/LFU state. The notification may
+         * synchronously delete or replace the key, invalidating kv. */
+        dbNotifyKeyAdded(c->db, key, kvtype);
+        kv = lookupKeyReadWithFlags(c->db, key, LOOKUP_NOEFFECTS);
+    }
+
+    /* Keep RESTORE's historical LRU/LFU behavior: passing NULL prevents LRM
+     * bookkeeping from overwriting the state set by objectSetLRUOrLFU(). */
     keyModified(c,c->db,key,NULL,1);
     notifyKeyspaceEvent(NOTIFY_GENERIC,"restore",key,c->db->id);
     KSN_INVALIDATE_KVOBJ(kv);

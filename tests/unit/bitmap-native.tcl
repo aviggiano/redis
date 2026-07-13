@@ -965,6 +965,10 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
 
         r del rdb:type29:gcra
         if {[catch {r restore rdb:type29:gcra 0 $payload} err]} {
+            if {[info exists ::env(REQUIRE_GCRA_COMPAT)] &&
+                $::env(REQUIRE_GCRA_COMPAT) eq "1"} {
+                fail "ENABLE_GCRA build rejected the reserved type-29 payload: $err"
+            }
             # GCRA is held out of normal builds, so its permanently reserved
             # type is unknown rather than available for bitmap reuse.
             assert_match "*Bad data format*" $err
@@ -1480,6 +1484,58 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
         assert_equal string [r type bitmap:aof-incr:convert]
         assert_equal $raw [r get bitmap:aof-incr:convert]
     }
+
+    test {native-source BITOP precedes destination notification writes in AOF} {
+        set src bitmap:aof-notify:bitop-native-source
+        set dest bitmap:aof-notify:bitop-destination
+        set value module-overwrote-native-source-bitop
+
+        r module load $bitmapnotifymodule
+        r set $src [binary format H* f0]
+        assert_equal OK [r bitmap convert $src NATIVE]
+        r set $dest old
+
+        assert_equal OK [r bitmapnotify.clear]
+        assert_equal OK [r bitmapnotify.arm $dest overwritten set $value]
+        assert_equal 1 [r bitop or $dest $src]
+        assert_equal string [r type $dest]
+        assert_equal $value [r get $dest]
+
+        set digest_before [debug_digest]
+        r debug loadaof
+        assert_equal $digest_before [debug_digest]
+        assert_equal bitmap [r type $src]
+        assert_equal string [r type $dest]
+        assert_equal $value [r get $dest]
+        assert_equal OK [r module unload bitmapnotify]
+    }
+
+    test {RESTORE precedes NEW notification writes in AOF} {
+        set src bitmap:aof-notify:restore-source
+        set dest bitmap:aof-notify:restore-destination
+        set value module-overwrote-restore
+
+        r config set bitmap-default-native yes
+        r setbit $src $::sparse_public_offset 1
+        r config set bitmap-default-native no
+        set payload [r dump $src]
+
+        r module load $bitmapnotifymodule
+        assert_equal OK [r bitmapnotify.clear]
+        assert_equal OK [r bitmapnotify.arm $dest new set $value]
+        assert_equal OK [r restore $dest 0 $payload]
+        assert_equal 1 [r bitmapnotify.hits]
+        assert_equal string [r type $dest]
+        assert_equal $value [r get $dest]
+
+        set digest_before [debug_digest]
+        r debug loadaof
+        assert_equal $digest_before [debug_digest]
+        assert_equal bitmap [r type $src]
+        assert_equal string [r type $dest]
+        assert_equal $value [r get $dest]
+        assert_equal OK [r module unload bitmapnotify]
+    }
 }
 
 start_server {tags {"bitmap" "bitmap-native" "repl" "external:skip" "cluster:skip"}} {
@@ -1759,6 +1815,54 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "modules" "external:skip" "c
             arm_bitmap_notify $master $key overwritten set $value
             assert_equal 1 [$master bitop or $key \
                 bitmap:notify-race:bitop-src1 bitmap:notify-race:bitop-src2]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {BITOP native-source destination notification preserves replication order} {
+            set key bitmap:notify-race:bitop-native-source-overwritten
+            set source bitmap:notify-race:bitop-native-source
+            set value module-overwrote-native-source-bitop
+
+            $master set $source [binary format H* f0]
+            assert_equal OK [$master bitmap convert $source NATIVE]
+            $master set $key old
+            wait_for_ofs_sync $master $replica
+            assert_equal bitmap [$replica type $source]
+
+            arm_bitmap_notify $master $key overwritten set $value
+            assert_equal 1 [$master bitop or $key $source]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {empty native-source BITOP deletion preserves replication order} {
+            set key bitmap:notify-race:bitop-native-empty-destination
+            set source bitmap:notify-race:bitop-native-empty-source
+            set value module-recreated-empty-native-bitop-destination
+
+            $master set $source ""
+            assert_equal OK [$master bitmap convert $source NATIVE]
+            $master set $key old
+            wait_for_ofs_sync $master $replica
+            assert_equal bitmap [$replica type $source]
+
+            arm_bitmap_notify $master $key del set $value
+            assert_equal 0 [$master bitop or $key $source]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {RESTORE NEW notification mutation is safe and ordered} {
+            set key bitmap:notify-race:restore-new
+            set source bitmap:notify-race:restore-source
+            set value module-overwrote-restore-new
+
+            $master config set bitmap-default-native yes
+            $master setbit $source $::sparse_public_offset 1
+            set payload [$master dump $source]
+            $master del $key
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key new set $value
+            assert_equal OK [$master restore $key 0 $payload]
             assert_bitmap_notify_string $master $replica $key $value
         }
 
@@ -3295,6 +3399,10 @@ start_server {tags {"bitmap" "bitmap-native" "gcra" "aof" "external:skip" "clust
         set gcra_payload [rdb_dump_payload_from_hex 1d 01]
 
         if {[catch {r restore bitmap:legacy-gcra 0 $gcra_payload} err]} {
+            if {[info exists ::env(REQUIRE_GCRA_COMPAT)] &&
+                $::env(REQUIRE_GCRA_COMPAT) eq "1"} {
+                fail "ENABLE_GCRA build rejected the legacy GCRA payload: $err"
+            }
             assert_match "*Bad data format*" $err
             assert_equal none [r type bitmap:legacy-gcra]
         } else {
