@@ -1243,9 +1243,11 @@ static void rdbBitmapRawSetRange(unsigned char *raw, uint32_t start,
 }
 
 static void rdbBitmapRawStats(const unsigned char *raw, size_t len,
-                              uint32_t *cardinality, uint32_t *runs)
+                              uint32_t *cardinality, uint32_t *runs,
+                              size_t *array_values_cost)
 {
     uint32_t card = 0, run_count = 0;
+    size_t values_cost = 0;
     int previous_set = 0;
 
     for (size_t i = 0; i < len; i++) {
@@ -1255,21 +1257,20 @@ static void rdbBitmapRawStats(const unsigned char *raw, size_t len,
         card += __builtin_popcount(value);
         run_count += __builtin_popcount(starts);
         previous_set = value & 1;
+
+        /* ARRAY is only considered for sparse chunks. Account its position
+         * lengths while this cache-friendly byte scan is already in flight,
+         * instead of walking all 65,536 possible bits again. */
+        if (value != 0) {
+            for (int bit = 0; bit < 8; bit++) {
+                if (value & (0x80 >> bit))
+                    values_cost += rdbBitmapLenSize(i * 8 + bit);
+            }
+        }
     }
     *cardinality = card;
     *runs = run_count;
-}
-
-static size_t rdbBitmapArrayCost(const unsigned char *raw, size_t len,
-                                 uint32_t cardinality)
-{
-    size_t cost = rdbBitmapLenSize(cardinality);
-
-    for (uint32_t bit = 0; bit < len * 8; bit++) {
-        if (rdbBitmapRawGetBit(raw, bit))
-            cost += rdbBitmapLenSize(bit);
-    }
-    return cost;
+    *array_values_cost = values_cost;
 }
 
 static size_t rdbBitmapRunCost(const unsigned char *raw, size_t len,
@@ -1293,10 +1294,15 @@ static int rdbSaveBitmapArray(rio *rdb, const unsigned char *raw, size_t len,
 
     if ((n = rdbSaveLen(rdb, cardinality)) == -1) return C_ERR;
     *nwritten += n;
-    for (uint32_t bit = 0; bit < len * 8; bit++) {
-        if (!rdbBitmapRawGetBit(raw, bit)) continue;
-        if ((n = rdbSaveLen(rdb, bit)) == -1) return C_ERR;
-        *nwritten += n;
+    for (size_t byte = 0; byte < len; byte++) {
+        unsigned char value = raw[byte];
+        if (value == 0) continue;
+
+        for (int bit = 0; bit < 8; bit++) {
+            if (!(value & (0x80 >> bit))) continue;
+            if ((n = rdbSaveLen(rdb, byte * 8 + bit)) == -1) return C_ERR;
+            *nwritten += n;
+        }
     }
     return C_OK;
 }
@@ -1327,17 +1333,18 @@ static int rdbSaveBitmapChunk(uint64_t chunk_index,
     bitmapRDBSaveState *state = privdata;
     uint32_t cardinality, runs;
     size_t raw_cost, array_cost = SIZE_MAX, run_cost = SIZE_MAX;
+    size_t array_values_cost;
     uint64_t encoding;
     int n;
 
-    rdbBitmapRawStats(raw, len, &cardinality, &runs);
+    rdbBitmapRawStats(raw, len, &cardinality, &runs, &array_values_cost);
     serverAssert(cardinality != 0);
     raw_cost = rdbBitmapLenSize(len) + len;
 
     /* Only perform the more detailed second scan when that encoding can beat
      * raw bytes even under its optimistic one-byte-per-value lower bound. */
     if (rdbBitmapLenSize(cardinality) + cardinality < raw_cost)
-        array_cost = rdbBitmapArrayCost(raw, len, cardinality);
+        array_cost = rdbBitmapLenSize(cardinality) + array_values_cost;
     if (rdbBitmapLenSize(runs) + (size_t)runs * 2 < raw_cost)
         run_cost = rdbBitmapRunCost(raw, len, runs);
 
