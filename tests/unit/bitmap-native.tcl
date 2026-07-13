@@ -3286,3 +3286,30 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "needs:save" "cluster
         r del bitmap:checkrdb:sparse bitmap:checkrdb:dense
     }
 }
+
+# GCRA is deliberately command-inaccessible, but developer builds can enable
+# its legacy persistence loader. A command-form AOF rewrite must therefore use
+# self-contained RESTORE rather than the unavailable GCRASETVALUE command.
+start_server {tags {"bitmap" "bitmap-native" "gcra" "aof" "external:skip" "cluster:skip"} overrides {appendonly yes aof-use-rdb-preamble no auto-aof-rewrite-percentage 0}} {
+    test {legacy GCRA values coexist with bitmap command-form AOF rewrites} {
+        set gcra_payload [rdb_dump_payload_from_hex 1d 01]
+
+        if {[catch {r restore bitmap:legacy-gcra 0 $gcra_payload} err]} {
+            assert_match "*Bad data format*" $err
+            assert_equal none [r type bitmap:legacy-gcra]
+        } else {
+            r config set bitmap-default-native yes
+            r setbit bitmap:alongside-gcra $::bitmap_max_offset 1
+            r config set bitmap-default-native no
+
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            restart_server 0 true false
+            wait_done_loading r
+
+            assert_equal gcra [r type bitmap:legacy-gcra]
+            assert_equal bitmap [r type bitmap:alongside-gcra]
+            assert_equal 1 [r getbit bitmap:alongside-gcra $::bitmap_max_offset]
+        }
+    }
+}

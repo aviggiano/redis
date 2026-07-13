@@ -2474,20 +2474,6 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
     return 1;
 }
 
-#ifdef ENABLE_GCRA
-int rewriteGCRAObject(rio *r, robj *key, robj *o) {
-    long long val;
-    getLongLongFromGCRAObject(o, &val);
-
-    /* GCRASETVALUE <key> <tat> */
-    if (rioWriteBulkCount(r,'*',3) == 0) return 0;
-    if (rioWriteBulkString(r,"GCRASETVALUE",12) == 0) return 0;
-    if (rioWriteBulkObject(r,key) == 0) return 0;
-    if (rioWriteBulkLongLong(r,val) == 0) return 0;
-    return 1;
-}
-#endif
-
 /* Call the module type callback in order to rewrite a data type
  * that is exported by a module and is not handled by Redis itself.
  * The function returns 0 on error, 1 on success. */
@@ -2504,7 +2490,7 @@ int rewriteModuleObject(rio *r, robj *key, robj *o, int dbid) {
     return io.error ? 0 : 1;
 }
 
-int rewriteBitmapObject(rio *r, robj *key, robj *o, int dbid) {
+static int rewriteObjectAsRestore(rio *r, robj *key, robj *o, int dbid) {
     rio payload;
     /* Metadata classes with AOF callbacks are emitted below. The RESTORE
      * payload keeps RDB-only classes that have no AOF representation. */
@@ -2518,6 +2504,19 @@ int rewriteBitmapObject(rio *r, robj *key, robj *o, int dbid) {
              rioWriteBulkString(r,"REPLACE",7);
     sdsfree(payload.io.buffer.ptr);
     return ok;
+}
+
+#ifdef ENABLE_GCRA
+/* GCRA's command surface is deliberately held back, including its old
+ * GCRASETVALUE replay command. Developer builds that enable legacy GCRA RDB
+ * loading must nevertheless be able to rewrite and reload those values. */
+static int rewriteGCRAObject(rio *r, robj *key, robj *o, int dbid) {
+    return rewriteObjectAsRestore(r, key, o, dbid);
+}
+#endif
+
+int rewriteBitmapObject(rio *r, robj *key, robj *o, int dbid) {
+    return rewriteObjectAsRestore(r, key, o, dbid);
 }
 
 static int rewriteFunctions(rio *aof) {
@@ -2671,7 +2670,7 @@ int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime) {
         if (rewriteStreamObject(r,key,o) == 0) return C_ERR;
 #ifdef ENABLE_GCRA
     } else if (o->type == OBJ_GCRA) {
-        if (rewriteGCRAObject(r,key,o) == 0) return C_ERR;
+        if (rewriteGCRAObject(r,key,o,dbid) == 0) return C_ERR;
 #endif
     } else if (o->type == OBJ_ARRAY) {
         if (rewriteArrayObject(r,key,o) == 0) return C_ERR;
