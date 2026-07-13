@@ -77,6 +77,7 @@ uint64_t bitmapObjectGetUnsignedBitfield(const robj *o, uint64_t offset, uint64_
 int bitmapObjectSetUnsignedBitfield(robj *o, uint64_t offset, uint64_t bits, uint64_t value);
 void bitmapObjectOptimize(robj *o);
 sds bitmapObjectMaterialize(const robj *o);
+sds bitmapObjectMaterializeForConversion(const robj *o);
 robj *bitmapObjectsBitop(bitmapBitop op, robj **objects, size_t numkeys, uint64_t maxlen);
 
 #endif /* __BITMAP_ROARING_H */

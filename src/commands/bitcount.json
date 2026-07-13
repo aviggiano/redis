@@ -1,7 +1,7 @@
 {
     "BITCOUNT": {
-        "summary": "Counts the number of set bits (population counting) in a string.",
-        "complexity": "O(N)",
+        "summary": "Counts the set bits in a string or native bitmap.",
+        "complexity": "O(N) for an N-byte string range and O(C) for C native compressed containers intersecting the range.",
         "group": "bitmap",
         "since": "2.6.0",
         "arity": -2,

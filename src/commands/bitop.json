@@ -1,7 +1,7 @@
 {
     "BITOP": {
-        "summary": "Performs bitwise operations on multiple strings, and stores the result.",
-        "complexity": "O(N)",
+        "summary": "Performs bitwise operations on strings and native bitmaps, and stores the result.",
+        "complexity": "O(S + C), where S is the total size of string operands processed and C is the total number of native compressed containers visited.",
         "group": "bitmap",
         "since": "2.6.0",
         "arity": -4,

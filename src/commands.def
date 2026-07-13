@@ -704,6 +704,78 @@ struct COMMAND_ARG BITFIELD_RO_Args[] = {
 {MAKE_ARG("get-block",ARG_TYPE_BLOCK,-1,"GET",NULL,NULL,CMD_ARG_OPTIONAL|CMD_ARG_MULTIPLE|CMD_ARG_MULTIPLE_TOKEN,2,NULL),.subargs=BITFIELD_RO_get_block_Subargs},
 };
 
+/********** BITMAP CONVERT ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* BITMAP CONVERT history */
+#define BITMAP_CONVERT_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* BITMAP CONVERT tips */
+#define BITMAP_CONVERT_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* BITMAP CONVERT key specs */
+keySpec BITMAP_CONVERT_Keyspecs[1] = {
+{NULL,CMD_KEY_RW|CMD_KEY_UPDATE,KSPEC_BS_INDEX,.bs.index={2},KSPEC_FK_RANGE,.fk.range={0,1,0}}
+};
+#endif
+
+/* BITMAP CONVERT representation argument table */
+struct COMMAND_ARG BITMAP_CONVERT_representation_Subargs[] = {
+{MAKE_ARG("native",ARG_TYPE_PURE_TOKEN,-1,"NATIVE",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("string",ARG_TYPE_PURE_TOKEN,-1,"STRING",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+};
+
+/* BITMAP CONVERT argument table */
+struct COMMAND_ARG BITMAP_CONVERT_Args[] = {
+{MAKE_ARG("key",ARG_TYPE_KEY,0,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("representation",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_NONE,2,NULL),.subargs=BITMAP_CONVERT_representation_Subargs},
+};
+
+/********** BITMAP HELP ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* BITMAP HELP history */
+#define BITMAP_HELP_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* BITMAP HELP tips */
+#define BITMAP_HELP_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* BITMAP HELP key specs */
+#define BITMAP_HELP_Keyspecs NULL
+#endif
+
+/* BITMAP command table */
+struct COMMAND_STRUCT BITMAP_Subcommands[] = {
+{MAKE_CMD("convert","Converts a bitmap key between the legacy string type and native compressed bitmap type.","O(N), where N is the logical byte length of the value.","8.10.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITMAP_CONVERT_History,0,BITMAP_CONVERT_Tips,0,bitmapCommand,4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,BITMAP_CONVERT_Keyspecs,1,NULL,2),.args=BITMAP_CONVERT_Args},
+{MAKE_CMD("help","Returns helpful text about the bitmap subcommands.","O(1)","8.10.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITMAP_HELP_History,0,BITMAP_HELP_Tips,0,bitmapCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_BITMAP,BITMAP_HELP_Keyspecs,0,NULL,0)},
+{0}
+};
+
+/********** BITMAP ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* BITMAP history */
+#define BITMAP_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* BITMAP tips */
+#define BITMAP_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* BITMAP key specs */
+#define BITMAP_Keyspecs NULL
+#endif
+
 /********** BITOP ********************/
 
 #ifndef SKIP_CMD_HISTORY_TABLE
@@ -12430,13 +12502,14 @@ struct COMMAND_STRUCT redisCommandTable[] = {
 {MAKE_CMD("arseek","Sets the ARINSERT / ARRING cursor to a specific index.","O(1)","8.8.0",CMD_DOC_NONE,NULL,NULL,"array",COMMAND_GROUP_ARRAY,ARSEEK_History,0,ARSEEK_Tips,0,arseekCommand,3,CMD_WRITE|CMD_FAST,ACL_CATEGORY_ARRAY,ARSEEK_Keyspecs,1,NULL,2),.args=ARSEEK_Args},
 {MAKE_CMD("arset","Sets one or more contiguous values starting at an index in an array.","O(N) where N is the number of values","8.8.0",CMD_DOC_NONE,NULL,NULL,"array",COMMAND_GROUP_ARRAY,ARSET_History,0,ARSET_Tips,0,arsetCommand,-4,CMD_WRITE|CMD_DENYOOM|CMD_FAST,ACL_CATEGORY_ARRAY,ARSET_Keyspecs,1,NULL,3),.args=ARSET_Args},
 /* bitmap */
-{MAKE_CMD("bitcount","Counts the number of set bits (population counting) in a string.","O(N)","2.6.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITCOUNT_History,1,BITCOUNT_Tips,0,bitcountCommand,-2,CMD_READONLY,ACL_CATEGORY_BITMAP,BITCOUNT_Keyspecs,1,NULL,2),.args=BITCOUNT_Args},
-{MAKE_CMD("bitfield","Performs arbitrary bitfield integer operations on strings.","O(1) for each subcommand specified","3.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITFIELD_History,0,BITFIELD_Tips,0,bitfieldCommand,-2,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,BITFIELD_Keyspecs,1,bitfieldGetKeys,2),.args=BITFIELD_Args},
-{MAKE_CMD("bitfield_ro","Performs arbitrary read-only bitfield integer operations on strings.","O(1) for each subcommand specified","6.0.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITFIELD_RO_History,0,BITFIELD_RO_Tips,0,bitfieldroCommand,-2,CMD_READONLY|CMD_FAST,ACL_CATEGORY_BITMAP,BITFIELD_RO_Keyspecs,1,NULL,2),.args=BITFIELD_RO_Args},
-{MAKE_CMD("bitop","Performs bitwise operations on multiple strings, and stores the result.","O(N)","2.6.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITOP_History,0,BITOP_Tips,0,bitopCommand,-4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,BITOP_Keyspecs,2,NULL,3),.args=BITOP_Args},
-{MAKE_CMD("bitpos","Finds the first set (1) or clear (0) bit in a string.","O(N)","2.8.7",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITPOS_History,1,BITPOS_Tips,0,bitposCommand,-3,CMD_READONLY,ACL_CATEGORY_BITMAP,BITPOS_Keyspecs,1,NULL,3),.args=BITPOS_Args},
-{MAKE_CMD("getbit","Returns a bit value by offset.","O(1)","2.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,GETBIT_History,0,GETBIT_Tips,0,getbitCommand,3,CMD_READONLY|CMD_FAST,ACL_CATEGORY_BITMAP,GETBIT_Keyspecs,1,NULL,2),.args=GETBIT_Args},
-{MAKE_CMD("setbit","Sets or clears the bit at offset of the string value. Creates the key if it doesn't exist.","O(1)","2.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,SETBIT_History,0,SETBIT_Tips,0,setbitCommand,4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,SETBIT_Keyspecs,1,NULL,3),.args=SETBIT_Args},
+{MAKE_CMD("bitcount","Counts the set bits in a string or native bitmap.","O(N) for an N-byte string range and O(C) for C native compressed containers intersecting the range.","2.6.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITCOUNT_History,1,BITCOUNT_Tips,0,bitcountCommand,-2,CMD_READONLY,ACL_CATEGORY_BITMAP,BITCOUNT_Keyspecs,1,NULL,2),.args=BITCOUNT_Args},
+{MAKE_CMD("bitfield","Performs arbitrary bitfield integer operations on strings or native bitmaps.","O(1) per string subcommand and O(log C) per native subcommand, where C is the compressed-container count. O(N) once when bitmap-default-native converts an N-byte string.","3.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITFIELD_History,0,BITFIELD_Tips,0,bitfieldCommand,-2,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,BITFIELD_Keyspecs,1,bitfieldGetKeys,2),.args=BITFIELD_Args},
+{MAKE_CMD("bitfield_ro","Performs arbitrary read-only bitfield integer operations on strings or native bitmaps.","O(1) per string subcommand and O(log C) per native subcommand, where C is the compressed-container count.","6.0.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITFIELD_RO_History,0,BITFIELD_RO_Tips,0,bitfieldroCommand,-2,CMD_READONLY|CMD_FAST,ACL_CATEGORY_BITMAP,BITFIELD_RO_Keyspecs,1,NULL,2),.args=BITFIELD_RO_Args},
+{MAKE_CMD("bitmap","A container for bitmap representation commands.","Depends on subcommand.","8.10.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITMAP_History,0,BITMAP_Tips,0,NULL,-2,0,0,BITMAP_Keyspecs,0,NULL,0),.subcommands=BITMAP_Subcommands},
+{MAKE_CMD("bitop","Performs bitwise operations on strings and native bitmaps, and stores the result.","O(S + C), where S is the total size of string operands processed and C is the total number of native compressed containers visited.","2.6.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITOP_History,0,BITOP_Tips,0,bitopCommand,-4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,BITOP_Keyspecs,2,NULL,3),.args=BITOP_Args},
+{MAKE_CMD("bitpos","Finds the first set (1) or clear (0) bit in a string or native bitmap.","O(N) for an N-byte string range and O(C) for C native compressed containers intersecting the range.","2.8.7",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,BITPOS_History,1,BITPOS_Tips,0,bitposCommand,-3,CMD_READONLY,ACL_CATEGORY_BITMAP,BITPOS_Keyspecs,1,NULL,3),.args=BITPOS_Args},
+{MAKE_CMD("getbit","Returns a bit value by offset from a string or native bitmap.","O(1) for strings and O(log C) for native bitmaps, where C is the number of compressed containers.","2.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,GETBIT_History,0,GETBIT_Tips,0,getbitCommand,3,CMD_READONLY|CMD_FAST,ACL_CATEGORY_BITMAP,GETBIT_Keyspecs,1,NULL,2),.args=GETBIT_Args},
+{MAKE_CMD("setbit","Sets or clears a bit in a string or native bitmap. Creates the key if it doesn't exist.","O(1) for a string and O(log C) for an existing native bitmap, where C is its compressed-container count. O(N) when bitmap-default-native converts an N-byte string first.","2.2.0",CMD_DOC_NONE,NULL,NULL,"bitmap",COMMAND_GROUP_BITMAP,SETBIT_History,0,SETBIT_Tips,0,setbitCommand,4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_BITMAP,SETBIT_Keyspecs,1,NULL,3),.args=SETBIT_Args},
 /* cluster */
 {MAKE_CMD("asking","Signals that a cluster client is following an -ASK redirect.","O(1)","3.0.0",CMD_DOC_NONE,NULL,NULL,"cluster",COMMAND_GROUP_CLUSTER,ASKING_History,0,ASKING_Tips,0,askingCommand,1,CMD_FAST,ACL_CATEGORY_CONNECTION,ASKING_Keyspecs,0,NULL,0)},
 {MAKE_CMD("cluster","A container for Redis Cluster commands.","Depends on subcommand.","3.0.0",CMD_DOC_NONE,NULL,NULL,"cluster",COMMAND_GROUP_CLUSTER,CLUSTER_History,0,CLUSTER_Tips,0,NULL,-2,0,0,CLUSTER_Keyspecs,0,NULL,0),.subcommands=CLUSTER_Subcommands},

@@ -1,7 +1,7 @@
 {
     "BITFIELD_RO": {
-        "summary": "Performs arbitrary read-only bitfield integer operations on strings.",
-        "complexity": "O(1) for each subcommand specified",
+        "summary": "Performs arbitrary read-only bitfield integer operations on strings or native bitmaps.",
+        "complexity": "O(1) per string subcommand and O(log C) per native subcommand, where C is the compressed-container count.",
         "group": "bitmap",
         "since": "6.0.0",
         "arity": -2,

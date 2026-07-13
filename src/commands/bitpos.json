@@ -1,7 +1,7 @@
 {
     "BITPOS": {
-        "summary": "Finds the first set (1) or clear (0) bit in a string.",
-        "complexity": "O(N)",
+        "summary": "Finds the first set (1) or clear (0) bit in a string or native bitmap.",
+        "complexity": "O(N) for an N-byte string range and O(C) for C native compressed containers intersecting the range.",
         "group": "bitmap",
         "since": "2.8.7",
         "arity": -3,

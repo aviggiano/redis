@@ -1,7 +1,7 @@
 {
     "BITFIELD": {
-        "summary": "Performs arbitrary bitfield integer operations on strings.",
-        "complexity": "O(1) for each subcommand specified",
+        "summary": "Performs arbitrary bitfield integer operations on strings or native bitmaps.",
+        "complexity": "O(1) per string subcommand and O(log C) per native subcommand, where C is the compressed-container count. O(N) once when bitmap-default-native converts an N-byte string.",
         "group": "bitmap",
         "since": "3.2.0",
         "arity": -2,

@@ -1215,10 +1215,13 @@ sds bitmapObjectMaterialize(const robj *o) {
     return bitmapObjectMaterializeRaw(o, 1);
 }
 
-typedef struct bitmapBitopSource {
-    const roaring_bitmap_t *roaring;
-    roaring_bitmap_t *owned;
-} bitmapBitopSource;
+/* Explicit rollback is an administrative operation on an already admitted
+ * native object. It is bounded by the fixed native v1 cap rather than the
+ * current protocol input limit, which may have been lowered since the value
+ * was created or restored. */
+sds bitmapObjectMaterializeForConversion(const robj *o) {
+    return bitmapObjectMaterializeRaw(o, 0);
+}
 
 typedef struct bitmapRawBitopSource {
     const unsigned char *raw;
@@ -1416,68 +1419,50 @@ static int bitmapRoaringHasRunContainers(const roaring_bitmap_t *roaring) {
     return ra_has_run_container(&roaring->high_low_container);
 }
 
-static int bitmapBitopSourcesBorrowedWithoutRuns(bitmapBitopSource *sources,
-                                                 size_t numkeys)
-{
+static int bitmapBitopSourcesBorrowedWithoutRuns(robj **objects,
+                                                 size_t numkeys) {
     for (size_t i = 0; i < numkeys; i++) {
-        if (sources[i].owned != NULL) return 0;
-        if (sources[i].roaring != NULL &&
-            bitmapRoaringHasRunContainers(sources[i].roaring))
+        robj *o = objects[i];
+        if (o == NULL) continue;
+        if (o->type != OBJ_BITMAP) return 0;
+        if (bitmapRoaringHasRunContainers(getBitmapObject(o)->roaring))
             return 0;
     }
     return 1;
 }
 
-static void bitmapObjectReleaseBitopSources(bitmapBitopSource *sources,
-                                            size_t numkeys)
+/* Return one operand in Roaring form. Native operands are borrowed; string
+ * operands are converted into a caller-owned temporary. Keeping ownership at
+ * this granularity lets large mixed BITOPs fold one string at a time instead
+ * of retaining one potentially large temporary per argument. */
+static const roaring_bitmap_t *bitmapObjectPrepareBitopSource(
+    robj *o, roaring_bitmap_t **owned)
 {
-    for (size_t i = 0; i < numkeys; i++) {
-        if (sources[i].owned != NULL)
-            roaring_bitmap_free(sources[i].owned);
-    }
+    *owned = NULL;
+    if (o == NULL) return NULL;
+    if (o->type == OBJ_BITMAP) return getBitmapObject(o)->roaring;
+
+    serverAssert(o->type == OBJ_STRING);
+    *owned = bitmapObjectRoaringFromString((unsigned char *)o->ptr,
+                                           sdslen(o->ptr), 0);
+    return *owned;
 }
 
-static void bitmapObjectPrepareBitopSources(robj **objects,
-                                            bitmapBitopSource *sources,
-                                            size_t numkeys)
-{
-    for (size_t i = 0; i < numkeys; i++) {
-        robj *o = objects[i];
+static roaring_bitmap_t *bitmapObjectCopyBitopSource(robj *o) {
+    roaring_bitmap_t *owned;
+    const roaring_bitmap_t *source =
+        bitmapObjectPrepareBitopSource(o, &owned);
 
-        sources[i].roaring = NULL;
-        sources[i].owned = NULL;
-        if (o == NULL) continue;
-
-        if (o->type == OBJ_BITMAP) {
-            sources[i].roaring = getBitmapObject(o)->roaring;
-        } else {
-            serverAssert(o->type == OBJ_STRING);
-            sources[i].owned =
-                bitmapObjectRoaringFromString((unsigned char *)o->ptr,
-                                              sdslen(o->ptr), 0);
-            sources[i].roaring = sources[i].owned;
-        }
-    }
-}
-
-static roaring_bitmap_t *bitmapObjectCopyBitopSource(bitmapBitopSource *source) {
-    /* Roarings built from string sources are owned temporaries that no later
-     * operand reads again (every caller seeds the accumulator from this
-     * source exactly once), so steal them instead of deep-copying. */
-    if (source->owned != NULL) {
-        roaring_bitmap_t *stolen = source->owned;
-        source->owned = NULL;
-        source->roaring = NULL;
-        return stolen;
-    }
-
-    roaring_bitmap_t *copy = source->roaring != NULL ?
-        roaring_bitmap_copy(source->roaring) : roaring_bitmap_create();
+    /* The first string conversion is already owned and becomes the
+     * accumulator directly. Native operands must be copied before mutation. */
+    if (owned != NULL) return owned;
+    roaring_bitmap_t *copy = source != NULL ?
+        roaring_bitmap_copy(source) : roaring_bitmap_create();
     serverAssert(copy != NULL);
     return copy;
 }
 
-static roaring_bitmap_t *bitmapObjectUnionBitopSources(bitmapBitopSource *sources,
+static roaring_bitmap_t *bitmapObjectUnionBitopSources(robj **objects,
                                                          size_t start,
                                                          size_t numkeys)
 {
@@ -1485,31 +1470,38 @@ static roaring_bitmap_t *bitmapObjectUnionBitopSources(bitmapBitopSource *source
     serverAssert(result != NULL);
 
     for (size_t i = start; i < numkeys; i++) {
-        if (sources[i].roaring != NULL)
-            roaring_bitmap_or_inplace(result, sources[i].roaring);
+        roaring_bitmap_t *owned;
+        const roaring_bitmap_t *source =
+            bitmapObjectPrepareBitopSource(objects[i], &owned);
+        if (source != NULL) roaring_bitmap_or_inplace(result, source);
+        if (owned != NULL) roaring_bitmap_free(owned);
     }
     return result;
 }
 
-static roaring_bitmap_t *bitmapObjectExactlyOneBitopSources(bitmapBitopSource *sources,
+static roaring_bitmap_t *bitmapObjectExactlyOneBitopSources(robj **objects,
                                                               size_t numkeys)
 {
-    roaring_bitmap_t *result = bitmapObjectCopyBitopSource(&sources[0]);
+    roaring_bitmap_t *result = bitmapObjectCopyBitopSource(objects[0]);
     roaring_bitmap_t *multiple = roaring_bitmap_create();
     serverAssert(multiple != NULL);
 
     for (size_t i = 1; i < numkeys; i++) {
+        roaring_bitmap_t *owned;
+        const roaring_bitmap_t *source =
+            bitmapObjectPrepareBitopSource(objects[i], &owned);
         roaring_bitmap_t *both;
 
-        if (sources[i].roaring == NULL) continue;
+        if (source == NULL) continue;
 
-        both = roaring_bitmap_and(result, sources[i].roaring);
+        both = roaring_bitmap_and(result, source);
         serverAssert(both != NULL);
         roaring_bitmap_or_inplace(multiple, both);
         roaring_bitmap_free(both);
 
-        roaring_bitmap_xor_inplace(result, sources[i].roaring);
+        roaring_bitmap_xor_inplace(result, source);
         roaring_bitmap_andnot_inplace(result, multiple);
+        if (owned != NULL) roaring_bitmap_free(owned);
     }
 
     roaring_bitmap_free(multiple);
@@ -1526,7 +1518,6 @@ static roaring_bitmap_t *bitmapObjectExactlyOneBitopSources(bitmapBitopSource *s
 robj *bitmapObjectsBitop(bitmapBitop op, robj **objects, size_t numkeys,
                          uint64_t maxlen)
 {
-    bitmapBitopSource *sources;
     roaring_bitmap_t *result = NULL;
     int optimize_result = 1;
     int shrink_result = 1;
@@ -1539,24 +1530,25 @@ robj *bitmapObjectsBitop(bitmapBitop op, robj **objects, size_t numkeys,
                                             (size_t)maxlen);
         optimize_result = 0;
         shrink_result = 0;
-        sources = NULL;
         goto bitop_result;
     }
-
-    sources = zcalloc(sizeof(*sources) * numkeys);
-    bitmapObjectPrepareBitopSources(objects, sources, numkeys);
 
     switch (op) {
     case BITOP_AND: {
         int skip_optimize =
             maxlen <= BITMAP_BITOP_FAST_RESULT_MAX_BYTES &&
-            bitmapBitopSourcesBorrowedWithoutRuns(sources, numkeys);
-        result = bitmapObjectCopyBitopSource(&sources[0]);
+            bitmapBitopSourcesBorrowedWithoutRuns(objects, numkeys);
+        result = bitmapObjectCopyBitopSource(objects[0]);
         for (size_t i = 1; i < numkeys; i++) {
-            if (sources[i].roaring != NULL)
-                roaring_bitmap_and_inplace(result, sources[i].roaring);
-            else
+            roaring_bitmap_t *owned;
+            const roaring_bitmap_t *source =
+                bitmapObjectPrepareBitopSource(objects[i], &owned);
+            if (source == NULL) {
                 roaring_bitmap_clear(result);
+                break;
+            }
+            roaring_bitmap_and_inplace(result, source);
+            if (owned != NULL) roaring_bitmap_free(owned);
         }
         if (skip_optimize) {
             optimize_result = 0;
@@ -1565,64 +1557,77 @@ robj *bitmapObjectsBitop(bitmapBitop op, robj **objects, size_t numkeys,
         break;
     }
     case BITOP_OR:
-        result = bitmapObjectCopyBitopSource(&sources[0]);
+        result = bitmapObjectCopyBitopSource(objects[0]);
         for (size_t i = 1; i < numkeys; i++) {
-            if (sources[i].roaring != NULL)
-                roaring_bitmap_or_inplace(result, sources[i].roaring);
+            roaring_bitmap_t *owned;
+            const roaring_bitmap_t *source =
+                bitmapObjectPrepareBitopSource(objects[i], &owned);
+            if (source != NULL) roaring_bitmap_or_inplace(result, source);
+            if (owned != NULL) roaring_bitmap_free(owned);
         }
         break;
     case BITOP_XOR:
-        result = bitmapObjectCopyBitopSource(&sources[0]);
+        result = bitmapObjectCopyBitopSource(objects[0]);
         for (size_t i = 1; i < numkeys; i++) {
-            if (sources[i].roaring != NULL)
-                roaring_bitmap_xor_inplace(result, sources[i].roaring);
+            roaring_bitmap_t *owned;
+            const roaring_bitmap_t *source =
+                bitmapObjectPrepareBitopSource(objects[i], &owned);
+            if (source != NULL) roaring_bitmap_xor_inplace(result, source);
+            if (owned != NULL) roaring_bitmap_free(owned);
         }
         break;
     case BITOP_NOT:
-        if (sources[0].owned == NULL && sources[0].roaring != NULL &&
+        if (objects[0] != NULL && objects[0]->type == OBJ_BITMAP &&
             maxlen <= BITMAP_BITOP_FAST_RESULT_MAX_BYTES) {
             optimize_result = 0;
             shrink_result = 0;
         }
-        result = bitmapObjectCopyBitopSource(&sources[0]);
+        result = bitmapObjectCopyBitopSource(objects[0]);
         roaring_bitmap_flip_inplace(result, 0, maxlen * 8);
         break;
     case BITOP_DIFF:
-        result = bitmapObjectCopyBitopSource(&sources[0]);
+        result = bitmapObjectCopyBitopSource(objects[0]);
         for (size_t i = 1; i < numkeys; i++) {
-            if (sources[i].roaring != NULL)
-                roaring_bitmap_andnot_inplace(result, sources[i].roaring);
+            roaring_bitmap_t *owned;
+            const roaring_bitmap_t *source =
+                bitmapObjectPrepareBitopSource(objects[i], &owned);
+            if (source != NULL) roaring_bitmap_andnot_inplace(result, source);
+            if (owned != NULL) roaring_bitmap_free(owned);
         }
         break;
-    case BITOP_DIFF1:
-        result = bitmapObjectUnionBitopSources(sources, 1, numkeys);
-        if (sources[0].roaring != NULL)
-            roaring_bitmap_andnot_inplace(result, sources[0].roaring);
+    case BITOP_DIFF1: {
+        roaring_bitmap_t *owned;
+        const roaring_bitmap_t *source;
+        result = bitmapObjectUnionBitopSources(objects, 1, numkeys);
+        source = bitmapObjectPrepareBitopSource(objects[0], &owned);
+        if (source != NULL) roaring_bitmap_andnot_inplace(result, source);
+        if (owned != NULL) roaring_bitmap_free(owned);
         break;
-    case BITOP_ANDOR:
-        result = bitmapObjectUnionBitopSources(sources, 1, numkeys);
-        if (sources[0].roaring != NULL)
-            roaring_bitmap_and_inplace(result, sources[0].roaring);
+    }
+    case BITOP_ANDOR: {
+        roaring_bitmap_t *owned;
+        const roaring_bitmap_t *source;
+        result = bitmapObjectUnionBitopSources(objects, 1, numkeys);
+        source = bitmapObjectPrepareBitopSource(objects[0], &owned);
+        if (source != NULL)
+            roaring_bitmap_and_inplace(result, source);
         else
             roaring_bitmap_clear(result);
+        if (owned != NULL) roaring_bitmap_free(owned);
         break;
+    }
     case BITOP_ONE:
-        result = bitmapObjectExactlyOneBitopSources(sources, numkeys);
+        result = bitmapObjectExactlyOneBitopSources(objects, numkeys);
         break;
     default:
         serverPanic("Unknown native bitmap BITOP");
     }
-
-    bitmapObjectReleaseBitopSources(sources, numkeys);
-
 bitop_result:
     /* Large or potentially run-friendly results still pay the conversion and
      * compaction cost before being stored; small native steady-state results
      * skip both full-result CRoaring walks above. */
     if (optimize_result) roaring_bitmap_run_optimize(result);
     if (shrink_result) roaring_bitmap_shrink_to_fit(result);
-    zfree(sources);
-
     bitmapObject *bitmap = zmalloc(sizeof(*bitmap));
     bitmap->byte_len = maxlen;
     bitmap->roaring = result;

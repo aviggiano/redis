@@ -1,6 +1,7 @@
 source tests/support/bitmap.tcl
 
 set testmodule [file normalize tests/modules/misc.so]
+set bitmapnotifymodule [file normalize tests/modules/bitmap_notify.so]
 set ::sparse_public_offset 65536
 set ::sparse_public_len 8193
 set ::bitmap_max_offset 4294967295
@@ -18,11 +19,79 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal no [lindex [r config get bitmap-default-native] 1]
     }
 
-    test {BITMAP command is not part of the v1 public surface} {
-        assert_equal {{}} [r command info bitmap]
-        assert_equal {{}} [r command info bitmap|convert]
-        assert_error {ERR unknown command 'bitmap'*} {r bitmap help}
-        assert_error {ERR unknown command 'bitmap'*} {r bitmap convert bitmap:convert:missing}
+    test {BITMAP exposes conversion and help as public commands} {
+        assert_not_equal {{}} [r command info bitmap]
+        assert_not_equal {{}} [r command info bitmap|convert]
+        assert_match {*CONVERT <key> NATIVE|STRING*} [r bitmap help]
+        assert_error {ERR wrong number of arguments*} {r bitmap convert bitmap:convert:missing}
+        assert_error {ERR syntax error} {r bitmap convert bitmap:convert:missing SIDEWAYS}
+    }
+
+    test {BITMAP CONVERT round trips logical bytes and preserves TTL} {
+        r config set bitmap-default-native no
+        set key bitmap:convert:explicit
+        set raw [binary format H* 80400100080000]
+        r del $key
+        r set $key $raw
+        r pexpire $key 60000
+        set expire_at [r pexpiretime $key]
+
+        assert_equal OK [r bitmap convert $key NATIVE]
+        assert_equal bitmap [r type $key]
+        assert_equal bitmap-roaring [r object encoding $key]
+        assert_equal $raw [r debug bitmap-raw $key]
+        assert_equal $expire_at [r pexpiretime $key]
+
+        # Converting to the current representation is a true no-op.
+        set dirty [s rdb_changes_since_last_save]
+        assert_equal OK [r bitmap convert $key NATIVE]
+        assert_equal $dirty [s rdb_changes_since_last_save]
+
+        assert_equal OK [r bitmap convert $key STRING]
+        assert_equal string [r type $key]
+        assert_equal $raw [r get $key]
+        assert_equal $expire_at [r pexpiretime $key]
+        set dirty [s rdb_changes_since_last_save]
+        assert_equal OK [r bitmap convert $key STRING]
+        assert_equal $dirty [s rdb_changes_since_last_save]
+    }
+
+    test {BITMAP CONVERT handles zeroes, integer strings, missing keys and wrong types} {
+        r del bitmap:convert:zeros bitmap:convert:int bitmap:convert:list
+        set zeros [string repeat [binary format H* 00] 6]
+        r set bitmap:convert:zeros $zeros
+        assert_equal OK [r bitmap convert bitmap:convert:zeros NATIVE]
+        assert_equal 0 [r bitcount bitmap:convert:zeros]
+        assert_equal $zeros [r debug bitmap-raw bitmap:convert:zeros]
+
+        r set bitmap:convert:int 12345
+        assert_equal int [r object encoding bitmap:convert:int]
+        assert_equal OK [r bitmap convert bitmap:convert:int NATIVE]
+        assert_equal "12345" [r debug bitmap-raw bitmap:convert:int]
+
+        assert_error {ERR no such key} {
+            r bitmap convert bitmap:convert:missing NATIVE
+        }
+        r rpush bitmap:convert:list element
+        assert_error {WRONGTYPE*} {
+            r bitmap convert bitmap:convert:list NATIVE
+        }
+    }
+
+    test {BITMAP CONVERT rollback is independent of a lowered protocol limit} {
+        set limit 1048576
+        set oldlimit [config_get_set proto-max-bulk-len [expr {$limit + 1024}]]
+        set raw [string repeat [binary format H* aa] [expr {$limit + 1}]]
+        set key bitmap:convert:limit
+        r set $key $raw
+        r config set proto-max-bulk-len $limit
+
+        assert_equal OK [r bitmap convert $key NATIVE]
+        assert_equal bitmap [r type $key]
+        assert_equal OK [r bitmap convert $key STRING]
+        assert_equal $raw [r get $key]
+        r del $key
+        r config set proto-max-bulk-len $oldlimit
     }
 
     test {bitmap-default-native no: SETBIT keeps creating strings} {
@@ -387,14 +456,32 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         r config set bitmap-default-native no
     }
 
+    test {WATCH observes explicit BITMAP CONVERT type changes} {
+        set key bitmap:public:watch:explicit
+        r set $key [binary format H* 80]
+        r watch $key
+        assert_equal OK [r bitmap convert $key NATIVE]
+        r multi
+        r ping
+        assert_equal {} [r exec]
+
+        r watch $key
+        assert_equal OK [r bitmap convert $key STRING]
+        r multi
+        r ping
+        assert_equal {} [r exec]
+    }
+
     test {native bitmap creation and conversion emit documented keyspace events in order} {
         r config set bitmap-default-native no
         r config set notify-keyspace-events {}
         r del bitmap:public:notify bitmap:public:notify:conv \
-            bitmap:public:notify:bitfield bitmap:public:notify:bitfield:fail
+            bitmap:public:notify:bitfield bitmap:public:notify:bitfield:fail \
+            bitmap:public:notify:explicit
         r set bitmap:public:notify:conv [binary format H* 80]
         r set bitmap:public:notify:bitfield [binary format H* 01]
         r set bitmap:public:notify:bitfield:fail [binary format H* ff]
+        r set bitmap:public:notify:explicit [binary format H* 80]
 
         r config set notify-keyspace-events Eocnb
         set rd [redis_deferring_client]
@@ -430,6 +517,15 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal {pmessage __keyevent@9__:* __keyevent@9__:type_changed bitmap:public:notify:bitfield:fail} [$rd read]
         assert_equal {pmessage __keyevent@9__:* __keyevent@9__:setbit bitmap:public:notify:bitfield:fail} [$rd read]
         r config set bitmap-default-native no
+
+        # Explicit conversion is a type change, not an overwrite or a bitmap
+        # data mutation, in both directions.
+        assert_equal OK [r bitmap convert bitmap:public:notify:explicit NATIVE]
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:type_changed bitmap:public:notify:explicit} [$rd read]
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:convert bitmap:public:notify:explicit} [$rd read]
+        assert_equal OK [r bitmap convert bitmap:public:notify:explicit STRING]
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:type_changed bitmap:public:notify:explicit} [$rd read]
+        assert_equal {pmessage __keyevent@9__:* __keyevent@9__:convert bitmap:public:notify:explicit} [$rd read]
 
         $rd close
         r config set notify-keyspace-events {}
@@ -533,6 +629,48 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal bitmap [r type bitop:imp:out]
         assert_equal [binary format H* 66] [r debug bitmap-raw bitop:imp:out]
         r config set bitmap-default-native no
+    }
+
+    test {all-string native BITOP converts only the bounded raw result} {
+        set bytes [expr {1024 * 1024 + 1}]
+        set raw [string repeat [binary format H* a5] $bytes]
+        r del bitop:bounded:string bitop:bounded:all-output
+        r set bitop:bounded:string $raw
+
+        r config set bitmap-default-native yes
+        assert_equal $bytes [r bitop or bitop:bounded:all-output \
+            bitop:bounded:string bitop:bounded:string bitop:bounded:string \
+            bitop:bounded:string bitop:bounded:string bitop:bounded:string \
+            bitop:bounded:string bitop:bounded:string]
+        r config set bitmap-default-native no
+
+        assert_equal string [r type bitop:bounded:string]
+        assert_equal bitmap [r type bitop:bounded:all-output]
+        assert_equal $raw [r debug bitmap-raw bitop:bounded:all-output]
+        r del bitop:bounded:string bitop:bounded:all-output
+    }
+
+    test {large mixed BITOP folds duplicate string operands incrementally} {
+        set bytes [expr {1024 * 1024 + 1}]
+        set raw [string repeat [binary format H* 55] $bytes]
+        r del bitop:bounded:mixed-string bitop:bounded:mixed-native \
+            bitop:bounded:mixed-output
+        r set bitop:bounded:mixed-string $raw
+        r config set bitmap-default-native yes
+        r setbit bitop:bounded:mixed-native [expr {$bytes * 8 - 2}] 1
+        r config set bitmap-default-native no
+
+        assert_equal $bytes [r bitop or bitop:bounded:mixed-output \
+            bitop:bounded:mixed-native \
+            bitop:bounded:mixed-string bitop:bounded:mixed-string \
+            bitop:bounded:mixed-string bitop:bounded:mixed-string \
+            bitop:bounded:mixed-string bitop:bounded:mixed-string]
+        assert_equal bitmap [r type bitop:bounded:mixed-output]
+        assert_equal string [r type bitop:bounded:mixed-string]
+        assert_equal 1 [r getbit bitop:bounded:mixed-output [expr {$bytes * 8 - 2}]]
+        assert_equal [expr {$bytes * 4 + 1}] [r bitcount bitop:bounded:mixed-output]
+        r del bitop:bounded:mixed-string bitop:bounded:mixed-native \
+            bitop:bounded:mixed-output
     }
 
     test {BITOP NOT rejects oversized string sources when destination would be native} {
@@ -1276,7 +1414,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
 }
 
 start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "cluster:skip" "logreqres:skip"} overrides {appendonly yes appendfsync always save {} aof-use-rdb-preamble no}} {
-    test {native bitmap create and conversion are written to incremental AOF as RESTORE} {
+    test {native creation and explicit conversion both ways use RESTORE in incremental AOF} {
         set aof [get_last_incr_aof_path r]
         set raw [binary format H* 80400100080000]
 
@@ -1286,7 +1424,8 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
 
         r set bitmap:aof-incr:convert $raw
         r pexpire bitmap:aof-incr:convert 600000
-        convert_string_bitmap_to_native r bitmap:aof-incr:convert
+        assert_equal OK [r bitmap convert bitmap:aof-incr:convert NATIVE]
+        assert_equal OK [r bitmap convert bitmap:aof-incr:convert STRING]
 
         set fp [open $aof r]
         fconfigure $fp -translation binary
@@ -1330,15 +1469,15 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
 
         assert_equal {} $forbidden
         assert_equal 1 $create_restore
-        assert_equal 1 $convert_restore
+        assert_equal 2 $convert_restore
 
         set digest_before [debug_digest]
         r debug loadaof
         assert_equal $digest_before [debug_digest]
         assert_equal bitmap [r type bitmap:aof-incr:create]
         assert_equal 1 [r getbit bitmap:aof-incr:create $::bitmap_max_offset]
-        assert_equal bitmap [r type bitmap:aof-incr:convert]
-        assert_equal $raw [r debug bitmap-raw bitmap:aof-incr:convert]
+        assert_equal string [r type bitmap:aof-incr:convert]
+        assert_equal $raw [r get bitmap:aof-incr:convert]
     }
 }
 
@@ -1470,6 +1609,30 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "external:skip" "cluster:ski
             assert_equal [$master debug digest] [$replica debug digest]
         }
 
+        test {BITMAP CONVERT replicates both type transitions deterministically} {
+            set key bitmap:public:repl:explicit-convert
+            set raw [binary format H* 80400100080000]
+            $master set $key $raw
+            $master pexpire $key 600000
+            set expire_at [$master pexpiretime $key]
+            wait_for_ofs_sync $master $replica
+
+            assert_equal OK [$master bitmap convert $key NATIVE]
+            wait_for_ofs_sync $master $replica
+            assert_equal bitmap [$master type $key]
+            assert_equal bitmap [$replica type $key]
+            assert_equal $raw [$replica debug bitmap-raw $key]
+            assert_equal $expire_at [$replica pexpiretime $key]
+
+            assert_equal OK [$master bitmap convert $key STRING]
+            wait_for_ofs_sync $master $replica
+            assert_equal string [$master type $key]
+            assert_equal string [$replica type $key]
+            assert_equal $raw [$replica get $key]
+            assert_equal $expire_at [$replica pexpiretime $key]
+            assert_equal [$master debug digest] [$replica debug digest]
+        }
+
         test {RESTORE payloads replicate bitmap and string type transitions} {
             set raw [binary format H* 80400100080000]
 
@@ -1499,13 +1662,113 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "external:skip" "cluster:ski
     }
 }
 
-# Note: the notify-race tests that mutated the key from a module keyspace
-# notification callback ("new", "overwritten" and "type_changed" variants,
-# via tests/modules/bitmap_notify.c) are removed. With dbAddInternal() and
-# setKeyByLink() restored to the upstream shape, such a mutation hits the
-# pre-existing upstream use-after-free (the post-notification bookkeeping
-# dereferences the possibly freed value). Re-add them once the upstream fix
-# lands.
+start_server {tags {"bitmap" "bitmap-native" "repl" "modules" "external:skip" "cluster:skip"}} {
+    start_server {} {
+        set master [srv -1 client]
+        set master_host [srv -1 host]
+        set master_port [srv -1 port]
+        set replica [srv 0 client]
+
+        $master module load $bitmapnotifymodule
+        $replica replicaof $master_host $master_port
+        wait_for_sync $replica
+        wait_for_ofs_sync $master $replica
+
+        proc assert_bitmap_notify_no_key {master replica key} {
+            wait_for_ofs_sync $master $replica
+            assert_equal 1 [$master bitmapnotify.hits]
+            assert_equal 0 [$master exists $key]
+            assert_equal 0 [$replica exists $key]
+            assert_equal [$master debug digest] [$replica debug digest]
+        }
+
+        proc assert_bitmap_notify_string {master replica key value} {
+            wait_for_ofs_sync $master $replica
+            assert_equal 1 [$master bitmapnotify.hits]
+            assert_equal string [$master type $key]
+            assert_equal string [$replica type $key]
+            assert_equal $value [$master get $key]
+            assert_equal $value [$replica get $key]
+            assert_equal [$master debug digest] [$replica debug digest]
+        }
+
+        proc arm_bitmap_notify {master key event action args} {
+            assert_equal OK [$master bitmapnotify.clear]
+            assert_equal OK [$master bitmapnotify.arm $key $event $action {*}$args]
+        }
+
+        $master config set bitmap-default-native yes
+        $replica config set bitmap-default-native no
+
+        test {SETBIT native creation survives new notification deletion} {
+            set key bitmap:notify-race:setbit-new
+            $master del $key
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key new del
+            assert_equal 0 [$master setbit $key $::sparse_public_offset 1]
+            assert_bitmap_notify_no_key $master $replica $key
+        }
+
+        test {BITFIELD native creation survives new notification replacement} {
+            set key bitmap:notify-race:bitfield-new
+            set value module-overwrote-bitfield-new
+            $master del $key
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key new set $value
+            assert_equal {0} [$master bitfield $key SET u1 $::sparse_public_offset 1]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {BITOP native destination survives overwritten notification replacement} {
+            set key bitmap:notify-race:bitop-overwritten
+            set value module-overwrote-bitop
+            $master set bitmap:notify-race:bitop-src1 [binary format H* f0]
+            $master set bitmap:notify-race:bitop-src2 [binary format H* 0f]
+            $master set $key old
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key overwritten set $value
+            assert_equal 1 [$master bitop or $key \
+                bitmap:notify-race:bitop-src1 bitmap:notify-race:bitop-src2]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {BITFIELD conversion survives type_changed notification deletion} {
+            set key bitmap:notify-race:bitfield-type
+            $master set $key ""
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key type_changed del
+            assert_equal {0} [$master bitfield $key SET u1 $::sparse_public_offset 1]
+            assert_bitmap_notify_no_key $master $replica $key
+        }
+
+        test {BITOP native destination survives type_changed notification replacement} {
+            set key bitmap:notify-race:bitop-type
+            set value module-overwrote-bitop-type
+            $master set $key old
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key type_changed set $value
+            assert_equal 1 [$master bitop or $key \
+                bitmap:notify-race:bitop-src1 bitmap:notify-race:bitop-src2]
+            assert_bitmap_notify_string $master $replica $key $value
+        }
+
+        test {BITMAP CONVERT survives type_changed notification deletion} {
+            set key bitmap:notify-race:explicit-convert
+            set raw [binary format H* 80400100080000]
+            $master set $key $raw
+            wait_for_ofs_sync $master $replica
+
+            arm_bitmap_notify $master $key type_changed del
+            assert_equal OK [$master bitmap convert $key NATIVE]
+            assert_bitmap_notify_no_key $master $replica $key
+        }
+    }
+}
 
 proc seed_string_bitmap {key bits} {
     r del $key
@@ -2672,9 +2935,9 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
                 [bitmap_logical_raw bitop:dup:native:dest]
         }
 
-        # The same string key twice alongside a native source: each slot
-        # builds an independent owned roaring, so the slot-0 steal cannot
-        # affect the second operand.
+        # The same string key twice alongside a native source: the large mixed
+        # path converts and releases one operand at a time, so repeated keys do
+        # not multiply peak retained memory.
         foreach op {and or xor diff diff1 andor one} {
             r del bitop:dup2:string:dest bitop:dup2:native:dest
             r del bitop:dup2:string:s bitop:dup2:native:s

@@ -1,7 +1,7 @@
 {
     "GETBIT": {
-        "summary": "Returns a bit value by offset.",
-        "complexity": "O(1)",
+        "summary": "Returns a bit value by offset from a string or native bitmap.",
+        "complexity": "O(1) for strings and O(log C) for native bitmaps, where C is the number of compressed containers.",
         "group": "bitmap",
         "since": "2.2.0",
         "arity": 3,

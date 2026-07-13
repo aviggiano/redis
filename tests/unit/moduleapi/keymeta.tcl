@@ -149,6 +149,25 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
         flushallAndVerifyCleanup
     }
 
+    test {KEYMETA - BITMAP CONVERT preserves metadata in both directions} {
+        set key bitmap:meta:explicit
+        set raw [binary format H* 80400100080000]
+        r set $key $raw
+        setupKeyMeta $key 7 1 0
+        set expire_at [r pexpiretime $key]
+
+        foreach representation {NATIVE STRING} {
+            assert_equal OK [r bitmap convert $key $representation]
+            assert_equal $expire_at [r pexpiretime $key]
+            for {set cid 1} {$cid <= 7} {incr cid} {
+                assert_equal "meta$cid" [r keymeta.get [cname $cid] $key]
+            }
+        }
+        assert_equal string [r type $key]
+        assert_equal $raw [r get $key]
+        flushallAndVerifyCleanup
+    }
+
     # Validates metadata behavior across COPY/RENAME/MOVE operations
     # with varying numbers of metadata classes (1-7), key expiration states,
     # key types (string/hash), hash field expiration, and metadata class flags

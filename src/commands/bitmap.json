@@ -1,0 +1,9 @@
+{
+    "BITMAP": {
+        "summary": "A container for bitmap representation commands.",
+        "complexity": "Depends on subcommand.",
+        "group": "bitmap",
+        "since": "8.10.0",
+        "arity": -2
+    }
+}

@@ -1,7 +1,7 @@
 {
     "SETBIT": {
-        "summary": "Sets or clears the bit at offset of the string value. Creates the key if it doesn't exist.",
-        "complexity": "O(1)",
+        "summary": "Sets or clears a bit in a string or native bitmap. Creates the key if it doesn't exist.",
+        "complexity": "O(1) for a string and O(log C) for an existing native bitmap, where C is its compressed-container count. O(N) when bitmap-default-native converts an N-byte string first.",
         "group": "bitmap",
         "since": "2.2.0",
         "arity": 4,

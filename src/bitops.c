@@ -961,23 +961,28 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     if (keepmetadata) decrRefCount(argv[argc-1]);
 }
 
-/* Install a string-to-bitmap representation transition without treating the
+/* Install a string<->bitmap representation transition without treating the
  * logical key as deleted or overwritten. dbReplaceValueWithLink() preserves
  * the TTL and module key metadata and does not run key-unlink callbacks. The
  * installed value is serialized before any notification callback can mutate
- * it, then watchers are signaled and modules observe the bitmap from the
- * type_changed callback. The caller emits the triggering bitmap command event
- * after this helper returns. */
-static void bitmapInstallConvertedValue(client *c, robj *key, robj **bitmapref,
-                                        long long expire, dictEntryLink link)
+ * it, then watchers are signaled and modules observe the new type from the
+ * type_changed callback. The caller emits any triggering command event after
+ * this helper returns. */
+static void bitmapInstallRepresentationValue(client *c, robj *key,
+                                             robj **replacementref,
+                                             long long expire,
+                                             dictEntryLink link)
 {
     serverAssert(link != NULL);
-    serverAssert(dictGetKV(*link)->type == OBJ_STRING);
-    serverAssert((*bitmapref)->type == OBJ_BITMAP);
+    int oldtype = dictGetKV(*link)->type;
+    int newtype = (*replacementref)->type;
+    serverAssert((oldtype == OBJ_STRING || oldtype == OBJ_BITMAP) &&
+                 (newtype == OBJ_STRING || newtype == OBJ_BITMAP) &&
+                 oldtype != newtype);
 
-    dbReplaceValueWithLink(c->db, key, bitmapref, link);
-    bitmapPropagateRestore(c, key, *bitmapref, expire, 1);
-    keyModified(c, c->db, key, *bitmapref, 1);
+    dbReplaceValueWithLink(c->db, key, replacementref, link);
+    bitmapPropagateRestore(c, key, *replacementref, expire, 1);
+    keyModified(c, c->db, key, *replacementref, 1);
     notifyKeyspaceEvent(NOTIFY_TYPE_CHANGED, "type_changed", key, c->db->id);
 }
 
@@ -991,7 +996,7 @@ static void bitmapInstallConvertedValue(client *c, robj *key, robj **bitmapref,
  * (*created) or a native conversion of an existing string value (*converted).
  * Creation and conversion both propagate RESTORE, but installation differs:
  * missing keys use dbAddByLink(), while converted strings are installed as an
- * in-place representation transition by bitmapInstallConvertedValue(). */
+ * in-place representation transition by bitmapInstallRepresentationValue(). */
 static int bitmapResolveNativeTarget(client *c, kvobj *o, uint64_t maxbit,
                                      robj **nativeref, int *created,
                                      int *converted)
@@ -1066,13 +1071,16 @@ static void setbitCommandBitmap(client *c, kvobj *o, robj *native,
          * module subscribers may mutate or delete the key from their
          * callback. */
         bitmapPropagateRestore(c, c->argv[1], native, -1, 0);
-        kvobj *kv = dbAddByLink(c->db, c->argv[1], &native, &link);
-        keyModified(c,c->db,c->argv[1],kv,1);
+        dbAddByLink(c->db, c->argv[1], &native, &link);
+        /* The synchronous "new" callback may have deleted or replaced the
+         * key, invalidating both the returned kvobj and the insertion link. */
+        kvobj *current = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOEFFECTS);
+        keyModified(c,c->db,c->argv[1],current,1);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_BITMAP,"setbit",c->argv[1],c->db->id);
     } else if (converted) {
         long long expire = getExpire(c->db, c->argv[1]->ptr, o);
-        bitmapInstallConvertedValue(c, c->argv[1], &native, expire, link);
+        bitmapInstallRepresentationValue(c, c->argv[1], &native, expire, link);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_BITMAP,"setbit",c->argv[1],c->db->id);
     } else if (changed) {
@@ -1574,6 +1582,7 @@ void bitopCommand(client *c) {
     size_t minlen = 0;   /* Min len among the input keys. */
     unsigned char *res = NULL; /* Resulting string. */
     int has_native_bitmap = 0;
+    int native_destination = 0;
 
     /* Parse the operation name. */
     if ((opname[0] == 'a' || opname[0] == 'A') && !strcasecmp(opname,"and"))
@@ -1655,10 +1664,13 @@ void bitopCommand(client *c) {
         if (j == 0 || len[j] < minlen) minlen = len[j];
     }
 
-    /* Native bitmap sources, or a native destination configured through
-     * bitmap-default-native, take the dedicated native path; everything
-     * below keeps the string flow. */
-    if (has_native_bitmap || (maxlen && bitmapDefaultNativeEnabled(c))) {
+    native_destination = maxlen && bitmapDefaultNativeEnabled(c);
+
+    /* Existing native sources take the dedicated Roaring path. All-string
+     * operations use the mature raw/SIMD kernels below even when the configured
+     * destination is native, then convert only the single result. This bounds
+     * temporary memory independently of the number of source arguments. */
+    if (has_native_bitmap) {
         bitopCommandBitmap(c, op, targetkey, objects, numkeys,
                            maxlen, has_native_bitmap);
         for (j = 0; j < numkeys; j++) {
@@ -1668,6 +1680,23 @@ void bitopCommand(client *c) {
              * others. Owned decoded strings hold a reference and are told
              * apart by their src[] pointer, without dereferencing objects[]. */
             if (src[j]) decrRefCount(objects[j]);
+        }
+        zfree(src);
+        zfree(len);
+        zfree(objects);
+        return;
+    }
+
+    if (native_destination &&
+        (maxlen > BITMAP_OBJECT_MAX_BYTES ||
+         (!mustObeyClient(c) &&
+          maxlen > (uint64_t)server.proto_max_bulk_len)))
+    {
+        addReplyError(c, maxlen > BITMAP_OBJECT_MAX_BYTES ?
+                         "bitmap length exceeds native bitmap limit" :
+                         "string exceeds maximum allowed size (proto-max-bulk-len)");
+        for (j = 0; j < numkeys; j++) {
+            if (objects[j]) decrRefCount(objects[j]);
         }
         zfree(src);
         zfree(len);
@@ -1982,9 +2011,18 @@ void bitopCommand(client *c) {
 
     /* Store the computed value into the target key */
     if (maxlen) {
-        robj *o = createObject(OBJ_STRING, res);
-        setKey(c, c->db, targetkey, &o, 0);
-        notifyKeyspaceEvent(NOTIFY_STRING,"set",targetkey,c->db->id);
+        if (native_destination) {
+            robj *bitmap = createBitmapObjectFromString(res, (size_t)maxlen);
+            sdsfree((sds)res);
+            serverAssert(bitmap != NULL);
+            bitmapPropagateRestore(c, targetkey, bitmap, -1, 0);
+            setKey(c, c->db, targetkey, &bitmap, 0);
+            notifyKeyspaceEvent(NOTIFY_BITMAP,"set",targetkey,c->db->id);
+        } else {
+            robj *o = createObject(OBJ_STRING, res);
+            setKey(c, c->db, targetkey, &o, 0);
+            notifyKeyspaceEvent(NOTIFY_STRING,"set",targetkey,c->db->id);
+        }
         server.dirty++;
     } else if (dbDelete(c->db,targetkey)) {
         keyModified(c,c->db,targetkey,NULL,1);
@@ -2618,9 +2656,9 @@ void bitfieldGeneric(client *c, int flags) {
             robj *created_bitmap = o;
             dbAddByLink(c->db, c->argv[1], &created_bitmap, &native_bitmap_link);
         } else {
-            bitmapInstallConvertedValue(c, c->argv[1], &o,
-                                        native_transition_expire,
-                                        native_bitmap_link);
+            bitmapInstallRepresentationValue(c, c->argv[1], &o,
+                                             native_transition_expire,
+                                             native_bitmap_link);
         }
     }
 
@@ -2662,6 +2700,79 @@ void bitfieldCommand(client *c) {
 
 void bitfieldroCommand(client *c) {
     bitfieldGeneric(c, BITFIELD_FLAG_READONLY);
+}
+
+/* BITMAP CONVERT key NATIVE|STRING
+ *
+ * Explicitly move one logical bitmap between the legacy string type and the
+ * native compressed type. This is the supported selective-rollout and
+ * rollback surface; conversion is an in-place type transition that preserves
+ * expiration and module metadata. */
+static void bitmapConvertCommand(client *c) {
+    int to_native;
+
+    if (!strcasecmp(c->argv[3]->ptr, "native"))
+        to_native = 1;
+    else if (!strcasecmp(c->argv[3]->ptr, "string"))
+        to_native = 0;
+    else {
+        addReplyErrorObject(c, shared.syntaxerr);
+        return;
+    }
+
+    dictEntryLink link;
+    kvobj *kv = lookupKeyWriteWithLink(c->db, c->argv[2], &link);
+    if (kv == NULL) {
+        addReplyErrorObject(c, shared.nokeyerr);
+        return;
+    }
+    if (checkStringOrBitmapType(c, kv)) return;
+
+    if ((to_native && kv->type == OBJ_BITMAP) ||
+        (!to_native && kv->type == OBJ_STRING))
+    {
+        addReply(c, shared.ok);
+        return;
+    }
+
+    robj *replacement;
+    if (to_native) {
+        uint64_t len = stringObjectLen(kv);
+        if (len > BITMAP_OBJECT_MAX_BYTES) {
+            addReplyError(c, "bitmap length exceeds native bitmap limit");
+            return;
+        }
+        replacement = bitmapObjectFromStringObject(kv);
+        serverAssert(replacement != NULL);
+    } else {
+        sds raw = bitmapObjectMaterializeForConversion(kv);
+        serverAssert(raw != NULL);
+        replacement = createObject(OBJ_STRING, raw);
+    }
+
+    long long expire = getExpire(c->db, c->argv[2]->ptr, kv);
+    bitmapInstallRepresentationValue(c, c->argv[2], &replacement,
+                                     expire, link);
+    notifyKeyspaceEvent(NOTIFY_BITMAP, "convert", c->argv[2], c->db->id);
+    server.dirty++;
+    addReply(c, shared.ok);
+}
+
+/* BITMAP <subcommand> ... -- container for bitmap representation commands. */
+void bitmapCommand(client *c) {
+    if (!strcasecmp(c->argv[1]->ptr, "help") && c->argc == 2) {
+        const char *help[] = {
+"CONVERT <key> NATIVE|STRING",
+"    Convert a bitmap key to the native compressed type or materialize it",
+"    back to a string. The conversion preserves TTL and module metadata.",
+NULL
+        };
+        addReplyHelp(c, help);
+    } else if (!strcasecmp(c->argv[1]->ptr, "convert") && c->argc == 4) {
+        bitmapConvertCommand(c);
+    } else {
+        addReplySubcommandSyntaxError(c);
+    }
 }
 
 #ifdef REDIS_TEST
