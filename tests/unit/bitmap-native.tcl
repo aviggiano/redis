@@ -962,15 +962,16 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
 
     test {RDB type 29 remains reserved for legacy GCRA values} {
         set payload [rdb_dump_payload_from_hex 1d 01]
-        set info [r command info gcra]
 
         r del rdb:type29:gcra
-        if {[llength [lindex $info 0]] == 0} {
-            catch {r restore rdb:type29:gcra 0 $payload} err
+        if {[catch {r restore rdb:type29:gcra 0 $payload} err]} {
+            # GCRA is held out of normal builds, so its permanently reserved
+            # type is unknown rather than available for bitmap reuse.
             assert_match "*Bad data format*" $err
             assert_equal none [r type rdb:type29:gcra]
         } else {
-            assert_equal OK [r restore rdb:type29:gcra 0 $payload]
+            # Developer builds may compile legacy GCRA persistence support
+            # without exposing its held-back command surface.
             assert_equal gcra [r type rdb:type29:gcra]
         }
     }
