@@ -14,7 +14,9 @@ jobs:
   test-ubuntu-latest:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       # Fail build if there are warnings
       # build with TLS just for compilation coverage
@@ -33,7 +35,9 @@ jobs:
   test-sanitizer-address:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - name: make
         # build with TLS module just for compilation coverage
         run: make SANITIZER=address REDIS_CFLAGS='-Werror -DDEBUG_ASSERTIONS -DREDIS_TEST' BUILD_TLS=module
@@ -46,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: Install test dependencies
@@ -79,11 +83,67 @@ jobs:
           REDIS_ROARING_MODULE: ${{ github.workspace }}/redis-roaring/build/libredis-roaring.so
         run: ./runtest --single unit/bitmap-native --debug-defrag --verbose --dump-logs --clients 1
 
+  test-gcra-bitmap-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y tcl8.6 tclx
+      - name: Build legacy GCRA persistence support
+        run: make -j"$(nproc)" OPTIMIZATION=-O0 REDIS_CFLAGS='-Werror -DDEBUG_ASSERTIONS -DREDIS_TEST -DENABLE_GCRA'
+      - name: Verify legacy GCRA and bitmap persistence coexistence
+        env:
+          REQUIRE_GCRA_COMPAT: 1
+        run: |
+          nm src/redis-server | awk '$3 == "createGCRAObject" { found = 1 } END { exit !found }'
+          ./runtest --single unit/bitmap-native --clients 1 --verbose --dump-logs \
+            --only 'RDB type 29 remains reserved for legacy GCRA values' \
+            --only 'legacy GCRA values coexist with bitmap command-form AOF rewrites'
+
+  test-bitmap-big-endian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Register the pinned emulator before checking out or executing PR code.
+      - name: Install s390x emulator
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: tonistiigi/binfmt:latest@sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705
+          platforms: s390x
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build and test native bitmaps on s390x
+        run: |
+          docker run --rm --platform linux/s390x \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            s390x/debian:bookworm-slim@sha256:727cc7bb3f0ee4e8e20745bef240504b221f6ac589748e05f08b60c19d592929 \
+            bash -euxo pipefail -c '
+              test "$(dpkg --print-architecture)" = s390x
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                build-essential ca-certificates procps tcl8.6 tclx
+              make -j2 OPTIMIZATION=-O0 MALLOC=libc SKIP_VEC_SETS=yes \
+                REDIS_CFLAGS="-Werror -DDEBUG_ASSERTIONS -DREDIS_TEST"
+              ./runtest --single unit/bitmap-native --clients 1 --verbose --dump-logs \
+                --only "native bitmap DUMP uses its permanent type ID and bounded sparse format" \
+                --only "native bitmap raw RDB payload round-trips across internal shapes" \
+                --only "BITOP mixed benchmark-shaped dense operands match string results" \
+                --only "native bitmap RDB round-trip with rdbcompression no" \
+                --only "redis-check-rdb validates dumps containing native bitmaps"
+            '
+
   build-debian-old:
     runs-on: ubuntu-latest
-    container: debian:buster
+    container: debian:buster@sha256:2a0c1b9175adf759420fe0fbd7f5b449038319171eb76554bb76cbe172b62b42
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       run: |
         sed -i 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list
@@ -94,7 +154,9 @@ jobs:
   build-macos-latest:
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       # Fail build if there are warnings
       # build with TLS just for compilation coverage
@@ -103,7 +165,9 @@ jobs:
   build-32bit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       run: |
         sudo apt-get update && sudo apt-get install libc6-dev-i386 gcc-multilib
@@ -112,15 +176,19 @@ jobs:
   build-libc-malloc:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       run: make REDIS_CFLAGS='-Werror' MALLOC=libc
 
   build-centos-jemalloc:
     runs-on: ubuntu-latest
-    container: quay.io/centos/centos:stream9
+    container: quay.io/centos/centos:stream9@sha256:0c9db821f54b244ec5e487056fe782e939db026240f52bc89e1d3a509dca7e8b
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       run: |
         dnf -y install which gcc make
@@ -128,9 +196,11 @@ jobs:
 
   build-old-chain-jemalloc:
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
+    container: ubuntu:20.04@sha256:c664f8f86ed5a386b0a340d981b8f81714e21a8b9c73f658c4bea56aa179d54a
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
     - name: make
       run: |
         apt-get update
