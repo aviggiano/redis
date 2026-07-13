@@ -326,6 +326,54 @@ robj *createBitmapObjectFromString(const unsigned char *buf, size_t len) {
     return o;
 }
 
+/* RDB loading reconstructs native values one bounded logical chunk at a time.
+ * These helpers intentionally accept Redis' raw bitmap byte order rather than
+ * a CRoaring serialization, keeping the persisted representation independent
+ * of the third-party library and of the host byte order. */
+robj *createBitmapObjectForRDB(uint64_t byte_len) {
+    if (byte_len > BITMAP_OBJECT_MAX_BYTES) return NULL;
+
+    robj *o = createBitmapObject();
+    getBitmapObject(o)->byte_len = byte_len;
+    return o;
+}
+
+int bitmapObjectAddRDBChunk(robj *o, uint64_t chunk_index,
+                            const unsigned char *buf, size_t len)
+{
+    bitmapObject *bitmap = getBitmapObject(o);
+    const size_t chunk_bytes =
+        BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
+    uint64_t byte_offset;
+    int cardinality;
+
+    if (len == 0 || len > chunk_bytes || chunk_index > UINT16_MAX)
+        return C_ERR;
+    if (chunk_index > UINT64_MAX / chunk_bytes) return C_ERR;
+    byte_offset = chunk_index * chunk_bytes;
+    if (byte_offset >= bitmap->byte_len ||
+        len != (size_t)min((uint64_t)chunk_bytes,
+                          bitmap->byte_len - byte_offset)) return C_ERR;
+
+    if (bitmapRawChunkFitsArray(buf, len, &cardinality)) {
+        if (cardinality == 0) return C_ERR;
+        bitmapObjectAppendRawArrayContainer(bitmap->roaring, buf, len,
+                                            cardinality,
+                                            (uint16_t)chunk_index);
+    } else {
+        bitmapObjectAppendRawBitsetContainer(bitmap->roaring, buf, len,
+                                             (uint16_t)chunk_index);
+    }
+    return C_OK;
+}
+
+void bitmapObjectFinishRDBLoad(robj *o) {
+    bitmapObject *bitmap = getBitmapObject(o);
+    roaring_bitmap_run_optimize(bitmap->roaring);
+    roaring_bitmap_shrink_to_fit(bitmap->roaring);
+    bitmapObjectRefreshAllocSize(bitmap);
+}
+
 robj *bitmapTypeDup(const robj *o) {
     bitmapObject *src = getBitmapObject(o);
     bitmapObject *dst = zmalloc(sizeof(*dst));
@@ -1046,21 +1094,11 @@ static void bitmapObjectMaterializeRawRange(unsigned char *raw,
     }
 }
 
-static void bitmapObjectMaterializeContainer(unsigned char *raw,
-                                             size_t byte_len,
-                                             uint16_t high16,
-                                             const container_t *container,
-                                             uint8_t typecode)
+static void bitmapObjectMaterializeContainerChunk(unsigned char *chunk,
+                                                  size_t chunk_len,
+                                                  const container_t *container,
+                                                  uint8_t typecode)
 {
-    const size_t container_bytes =
-        BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
-    uint64_t byte_base = (uint64_t)high16 * container_bytes;
-    if (byte_base >= byte_len) return;
-
-    size_t chunk_len = byte_len - (size_t)byte_base;
-    if (chunk_len > container_bytes) chunk_len = container_bytes;
-    unsigned char *chunk = raw + (size_t)byte_base;
-
     container = container_unwrap_shared(container, &typecode);
     switch (typecode) {
     case BITSET_CONTAINER_TYPE: {
@@ -1100,6 +1138,54 @@ static void bitmapObjectMaterializeContainer(unsigned char *raw,
     }
 }
 
+static void bitmapObjectMaterializeContainer(unsigned char *raw,
+                                             size_t byte_len,
+                                             uint16_t high16,
+                                             const container_t *container,
+                                             uint8_t typecode)
+{
+    const size_t container_bytes =
+        BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
+    uint64_t byte_base = (uint64_t)high16 * container_bytes;
+    if (byte_base >= byte_len) return;
+
+    size_t chunk_len = byte_len - (size_t)byte_base;
+    if (chunk_len > container_bytes) chunk_len = container_bytes;
+    bitmapObjectMaterializeContainerChunk(raw + (size_t)byte_base, chunk_len,
+                                          container, typecode);
+}
+
+/* Visit fixed-size logical chunks in ascending order, materializing at most
+ * one container into bounded scratch storage. Persistence uses this instead
+ * of the set-range iterator so dense fragmented bitsets remain O(logical
+ * bytes), not O(number of individual bit runs). The callback contract is
+ * representation-neutral and may stop the walk by returning C_ERR. */
+int bitmapObjectVisitNonEmptyChunks(const robj *o,
+                                    bitmapObjectChunkCallback *callback,
+                                    void *privdata)
+{
+    bitmapObject *bitmap = getBitmapObject(o);
+    const roaring_array_t *ra = &bitmap->roaring->high_low_container;
+    const size_t chunk_bytes =
+        BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
+    unsigned char raw[BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t)];
+
+    for (int32_t i = 0; i < ra->size; i++) {
+        uint64_t chunk_index = ra->keys[i];
+        uint64_t byte_base = chunk_index * chunk_bytes;
+        size_t len;
+
+        serverAssert(byte_base < bitmap->byte_len);
+        len = (size_t)min((uint64_t)chunk_bytes,
+                          bitmap->byte_len - byte_base);
+        memset(raw, 0, len);
+        bitmapObjectMaterializeContainerChunk(
+            raw, len, ra->containers[i], ra->typecodes[i]);
+        if (callback(chunk_index, raw, len, privdata) != C_OK) return C_ERR;
+    }
+    return C_OK;
+}
+
 static sds bitmapObjectMaterializeRoaring(const roaring_bitmap_t *roaring,
                                           size_t byte_len)
 {
@@ -1127,12 +1213,6 @@ static sds bitmapObjectMaterializeRaw(const robj *o, int proto_limited) {
  * logical length exceeds proto-max-bulk-len. */
 sds bitmapObjectMaterialize(const robj *o) {
     return bitmapObjectMaterializeRaw(o, 1);
-}
-
-/* RDB raw payloads are persisted data, not client protocol bulk strings.
- * DUMP serialization cannot fail, so Redis' allocator owns OOM handling. */
-sds bitmapObjectMaterializeForRDB(const robj *o) {
-    return bitmapObjectMaterializeRaw(o, 0);
 }
 
 typedef struct bitmapBitopSource {

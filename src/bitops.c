@@ -933,6 +933,13 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     int has_expire = expire != -1;
     int argc = 5;
 
+    /* The representation transition must suppress the original command even
+     * when there is currently no AOF, replica, backlog or migration consumer.
+     * Avoid serializing a payload in that common case: for a sparse bitmap its
+     * logical length may be hundreds of MiB despite tiny resident memory. */
+    preventCommandPropagation(c);
+    if (!shouldPropagateCommand(PROPAGATE_AOF | PROPAGATE_REPL)) return;
+
     createDumpPayload(&payload, bitmap, key, c->db->id, 0);
 
     argv[0] = createStringObject("RESTORE", 7);
@@ -945,7 +952,6 @@ static void bitmapPropagateRestore(client *c, robj *key, robj *bitmap,
     if (keepmetadata)
         argv[argc++] = createStringObject("KEEPMETADATA", 12);
 
-    preventCommandPropagation(c);
     alsoPropagate(c->db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL);
 
     decrRefCount(argv[0]);

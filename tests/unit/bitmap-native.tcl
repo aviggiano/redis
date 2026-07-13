@@ -3,6 +3,7 @@ source tests/support/bitmap.tcl
 set testmodule [file normalize tests/modules/misc.so]
 set ::sparse_public_offset 65536
 set ::sparse_public_len 8193
+set ::bitmap_max_offset 4294967295
 
 proc wait_for_bitmap_defrag_stop {maxtries delay} {
     wait_for_condition $maxtries $delay {
@@ -794,7 +795,74 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         assert_equal $raw [r get bitmap:restore:target]
     }
 
-    test {native bitmap raw RDB restores run containers without capacity bloat} {
+    test {native bitmap DUMP uses its permanent type ID and bounded sparse format} {
+        set oldcomp [config_get_set rdbcompression no]
+        set maxbit $::bitmap_max_offset
+
+        r config set bitmap-default-native yes
+        r del bitmap:rdb:max bitmap:rdb:max:restored
+        assert_equal 0 [r setbit bitmap:rdb:max $maxbit 1]
+        r config set bitmap-default-native no
+
+        set payload [r dump bitmap:rdb:max]
+        binary scan [string index $payload 0] cu type
+        assert_equal 30 $type
+        binary scan [string range $payload 0 19] H* object_prefix
+        assert_equal 1e01802000000001800000ffff0001800000ffff $object_prefix
+        assert_lessthan [string length $payload] 128 \
+            "maximum-offset sparse dump unexpectedly grew to [string length $payload] bytes"
+
+        r restore bitmap:rdb:max:restored 0 $payload
+        assert_equal bitmap [r type bitmap:rdb:max:restored]
+        assert_equal 1 [r bitcount bitmap:rdb:max:restored]
+        assert_equal $maxbit [r bitpos bitmap:rdb:max:restored 1]
+        assert_equal 1 [r getbit bitmap:rdb:max:restored $maxbit]
+
+        r del bitmap:rdb:max bitmap:rdb:max:restored
+        r config set rdbcompression $oldcomp
+    }
+
+    test {RDB type 29 remains reserved for legacy GCRA values} {
+        set payload [rdb_dump_payload_from_hex 1d 01]
+        set info [r command info gcra]
+
+        r del rdb:type29:gcra
+        if {[llength [lindex $info 0]] == 0} {
+            catch {r restore rdb:type29:gcra 0 $payload} err
+            assert_match "*Bad data format*" $err
+            assert_equal none [r type rdb:type29:gcra]
+        } else {
+            assert_equal OK [r restore rdb:type29:gcra 0 $payload]
+            assert_equal gcra [r type rdb:type29:gcra]
+        }
+    }
+
+    test {native bitmap RESTORE rejects malformed bounded records} {
+        foreach {name body} {
+            version             020000
+            excessive-length    01802000000100
+            impossible-count    010001
+            chunk-out-of-range  01010101000100
+            duplicate-chunk     016001020000010000000100
+            unordered-chunk     016001020100010000000100
+            zero-raw-chunk      01010100020100
+            high-array-bit      01010100000108
+            duplicate-array-bit 0101010000020000
+            zero-run-length     0101010001010000
+            adjacent-runs       01010100010200010101
+            unknown-encoding    0101010003
+            raw-length-mismatch 0101010002028000
+            encoded-header      c0
+            trailing-data       01000000
+        } {
+            set key "bitmap:rdb:malformed:$name"
+            catch {r restore $key 0 [native_bitmap_dump_payload_from_hex $body]} err
+            assert_match "*Bad data format*" $err
+            assert_equal none [r type $key]
+        }
+    }
+
+    test {native bitmap RDB restores run containers without capacity bloat} {
         set raw ""
         for {set i 0} {$i < 32} {incr i} {
             append raw [string repeat [binary format H* ff] 600]
@@ -1213,7 +1281,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
         set raw [binary format H* 80400100080000]
 
         r config set bitmap-default-native yes
-        r setbit bitmap:aof-incr:create $::sparse_public_offset 1
+        r setbit bitmap:aof-incr:create $::bitmap_max_offset 1
         r config set bitmap-default-native no
 
         r set bitmap:aof-incr:convert $raw
@@ -1246,6 +1314,10 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
                 if {$key eq "bitmap:aof-incr:create"} {
                     assert_equal 5 [llength $cmd]
                     assert_equal 0 [lindex $cmd 2]
+                    set payload [lindex $cmd 3]
+                    binary scan [string index $payload 0] cu type
+                    assert_equal 30 $type
+                    assert_lessthan [string length $payload] 128
                     incr create_restore
                 } elseif {$key eq "bitmap:aof-incr:convert"} {
                     assert_equal 7 [llength $cmd]
@@ -1264,6 +1336,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "external:skip" "clus
         r debug loadaof
         assert_equal $digest_before [debug_digest]
         assert_equal bitmap [r type bitmap:aof-incr:create]
+        assert_equal 1 [r getbit bitmap:aof-incr:create $::bitmap_max_offset]
         assert_equal bitmap [r type bitmap:aof-incr:convert]
         assert_equal $raw [r debug bitmap-raw bitmap:aof-incr:convert]
     }
@@ -1314,6 +1387,18 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "external:skip" "cluster:ski
             assert_equal 1 [$replica getbit bitmap:public:repl:direct 12345]
         }
 
+        test {maximum-offset sparse bitmap replicates with its logical length} {
+            $master config set bitmap-default-native yes
+            $master setbit bitmap:public:repl:max $::bitmap_max_offset 1
+            wait_for_ofs_sync $master $replica
+
+            assert_equal bitmap [$replica type bitmap:public:repl:max]
+            assert_equal $::bitmap_max_offset \
+                [$replica bitpos bitmap:public:repl:max 1]
+            assert_equal 1 \
+                [$replica getbit bitmap:public:repl:max $::bitmap_max_offset]
+        }
+
         test {BITOP destinations replicate deterministically across modes} {
             # String-only sources with a bitmap-default-native yes master: the native
             # destination decision is master-local, so the result arrives as
@@ -1361,6 +1446,7 @@ start_server {tags {"bitmap" "bitmap-native" "repl" "external:skip" "cluster:ski
             assert_equal 1 [$replica getbit bitmap:public:repl:direct 12345]
             assert_equal [binary format H* 00] [$replica debug bitmap-raw bitmap:public:repl:zero]
             assert_equal 1 [$replica getbit bitmap:public:repl:auto $::sparse_public_offset]
+            assert_equal 1 [$replica getbit bitmap:public:repl:max $::bitmap_max_offset]
             assert_equal [$master debug digest] [$replica debug digest]
         }
 

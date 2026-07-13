@@ -64,8 +64,16 @@ proc seed_native_bitmap {key bits} {
 }
 
 proc empty_native_bitmap_dump_payload {} {
-    # RDB_TYPE_BITMAP, empty raw string, RDB_VERSION 15, followed by an
+    return [native_bitmap_dump_payload_from_hex 010000]
+}
+
+proc native_bitmap_dump_payload_from_hex {body} {
+    return [rdb_dump_payload_from_hex 1e $body]
+}
+
+proc rdb_dump_payload_from_hex {type body} {
+    # Caller-supplied RDB type and object body, RDB_VERSION 15, followed by an
     # all-zero checksum. RESTORE accepts the zero checksum in test-built
     # payloads.
-    return [binary format H* 1d000f000000000000000000]
+    return [binary format H* "${type}${body}0f000000000000000000"]
 }

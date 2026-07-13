@@ -3740,6 +3740,7 @@ int redisOpArrayAppend(redisOpArray *oa, int dbid, robj **argv, int argc, int ta
 void redisOpArrayFree(redisOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
 void preventCommandPropagation(client *c);
+int shouldPropagateCommand(int target);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration);

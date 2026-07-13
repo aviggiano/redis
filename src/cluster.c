@@ -289,6 +289,15 @@ void restoreCommand(client *c) {
         addReplyError(c,"Bad data format");
         return;
     }
+    /* A DUMP payload contains exactly one object followed by its ten-byte
+     * version/checksum footer. Object loaders with an explicit record count
+     * must not silently accept extra records. */
+    if (payload.processed_bytes != sdslen(c->argv[3]->ptr) - 10) {
+        keyMetaSpecCleanup(&keymeta);
+        decrRefCount(obj);
+        addReplyError(c,"Bad data format");
+        return;
+    }
 
     /* Resolve the key's existence and its insertion link. On the common new-key
      * path dbAddInternal() below reuses the link instead of probing again. */

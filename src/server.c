@@ -3673,7 +3673,7 @@ int mustObeyClient(client *c) {
     return c->id == CLIENT_ID_AOF || c->flags & CLIENT_MASTER;
 }
 
-static int shouldPropagate(int target) {
+int shouldPropagateCommand(int target) {
     if (!server.replication_allowed || target == PROPAGATE_NONE || server.loading)
         return 0;
 
@@ -3705,7 +3705,7 @@ static int shouldPropagate(int target) {
  * to replicate SELECT for this command (used for database neutral commands).
  */
 static void propagateNow(int dbid, robj **argv, int argc, int target) {
-    if (!shouldPropagate(target))
+    if (!shouldPropagateCommand(target))
         return;
 
     /* This needs to be unreachable since the dataset should be fixed during
@@ -3736,7 +3736,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target) {
     robj **argvcopy;
     int j;
 
-    if (!shouldPropagate(target))
+    if (!shouldPropagateCommand(target))
         return;
 
     argvcopy = zmalloc(sizeof(robj*)*argc);

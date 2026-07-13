@@ -1159,34 +1159,406 @@ static ssize_t rdbSaveArraySlice(rio *rdb, arSlice *s, uint64_t slice_id,
     return nwritten;
 }
 
-static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
-    ssize_t n;
-    uint64_t byte_len = bitmapObjectLen(o);
-    sds raw;
+/* Native bitmap RDB format version 1.
+ *
+ * The format stores observable bitmap data, never CRoaring memory or portable
+ * serialization. This lets Redis change its in-memory implementation without
+ * invalidating persisted values and keeps the payload byte-order independent.
+ *
+ *   version, logical-byte-length, nonempty-chunk-count
+ *   repeated chunk-count times:
+ *       65536-bit chunk-index, encoding, encoding-payload
+ *
+ * ARRAY payload: value-count, strictly increasing set-bit offsets.
+ * RUN payload: run-count, then strictly separated start/run-length pairs.
+ * RAW payload: an RDB string of exactly the logical bytes in this chunk.
+ *
+ * Every field except RAW bytes uses rdbSaveLen()'s endian-stable unsigned
+ * encoding. The writer selects a compact representation per chunk and never
+ * allocates more than one fixed 8 KiB scratch buffer. Sparse values therefore
+ * stay proportional to their populated chunks even when their logical length
+ * is near BITMAP_OBJECT_MAX_BYTES. */
+#define BITMAP_RDB_FORMAT_VERSION 1
+#define BITMAP_RDB_CHUNK_BITS (1ULL << 16)
+#define BITMAP_RDB_CHUNK_BYTES (BITMAP_RDB_CHUNK_BITS / 8)
+#define BITMAP_RDB_ENC_ARRAY 0
+#define BITMAP_RDB_ENC_RUN 1
+#define BITMAP_RDB_ENC_RAW 2
 
-    raw = bitmapObjectMaterializeForRDB(o);
-    if (raw == NULL) return -1;
-    serverAssert((uint64_t)sdslen(raw) == byte_len);
+typedef struct bitmapRDBSaveState {
+    rio *rdb;
+    uint64_t chunks_written;
+    ssize_t nwritten;
+} bitmapRDBSaveState;
 
-    if ((n = rdbSaveRawString(rdb, (unsigned char *)raw, sdslen(raw))) == -1) {
-        sdsfree(raw);
-        return -1;
+static size_t rdbBitmapLenSize(uint64_t value) {
+    if (value < (1 << 6)) return 1;
+    if (value < (1 << 14)) return 2;
+    if (value <= UINT32_MAX) return 5;
+    return 9;
+}
+
+static int rdbBitmapRawGetBit(const unsigned char *raw, uint32_t bit) {
+    return (raw[bit >> 3] & (0x80 >> (bit & 7))) != 0;
+}
+
+static uint32_t rdbBitmapSkipBits(const unsigned char *raw, uint32_t bit,
+                                  uint32_t limit, int value)
+{
+    unsigned char full = value ? 0xff : 0;
+
+    while (bit < limit) {
+        if ((bit & 7) == 0 && bit + 8 <= limit &&
+            raw[bit >> 3] == full)
+        {
+            bit += 8;
+        } else if (rdbBitmapRawGetBit(raw, bit) == value) {
+            bit++;
+        } else {
+            break;
+        }
     }
-    sdsfree(raw);
+    return bit;
+}
 
-    return n;
+/* Set the inclusive range [start,end] in Redis' MSB-first raw bitmap order. */
+static void rdbBitmapRawSetRange(unsigned char *raw, uint32_t start,
+                                 uint32_t end)
+{
+    uint32_t bit = start;
+
+    while (bit <= end && (bit & 7) != 0) {
+        raw[bit >> 3] |= 0x80 >> (bit & 7);
+        bit++;
+    }
+    if (bit <= end) {
+        uint32_t bytes = (end - bit + 1) / 8;
+        memset(raw + (bit >> 3), 0xff, bytes);
+        bit += bytes * 8;
+    }
+    while (bit <= end) {
+        raw[bit >> 3] |= 0x80 >> (bit & 7);
+        bit++;
+    }
+}
+
+static void rdbBitmapRawStats(const unsigned char *raw, size_t len,
+                              uint32_t *cardinality, uint32_t *runs)
+{
+    uint32_t card = 0, run_count = 0;
+    int previous_set = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char value = raw[i];
+        unsigned char starts = value & (unsigned char)~(value >> 1);
+        if (previous_set) starts &= 0x7f;
+        card += __builtin_popcount(value);
+        run_count += __builtin_popcount(starts);
+        previous_set = value & 1;
+    }
+    *cardinality = card;
+    *runs = run_count;
+}
+
+static size_t rdbBitmapArrayCost(const unsigned char *raw, size_t len,
+                                 uint32_t cardinality)
+{
+    size_t cost = rdbBitmapLenSize(cardinality);
+
+    for (uint32_t bit = 0; bit < len * 8; bit++) {
+        if (rdbBitmapRawGetBit(raw, bit))
+            cost += rdbBitmapLenSize(bit);
+    }
+    return cost;
+}
+
+static size_t rdbBitmapRunCost(const unsigned char *raw, size_t len,
+                               uint32_t runs)
+{
+    uint32_t bit = 0, limit = len * 8;
+    size_t cost = rdbBitmapLenSize(runs);
+
+    while ((bit = rdbBitmapSkipBits(raw, bit, limit, 0)) < limit) {
+        uint32_t start = bit;
+        bit = rdbBitmapSkipBits(raw, bit, limit, 1);
+        cost += rdbBitmapLenSize(start) + rdbBitmapLenSize(bit - start);
+    }
+    return cost;
+}
+
+static int rdbSaveBitmapArray(rio *rdb, const unsigned char *raw, size_t len,
+                              uint32_t cardinality, ssize_t *nwritten)
+{
+    int n;
+
+    if ((n = rdbSaveLen(rdb, cardinality)) == -1) return C_ERR;
+    *nwritten += n;
+    for (uint32_t bit = 0; bit < len * 8; bit++) {
+        if (!rdbBitmapRawGetBit(raw, bit)) continue;
+        if ((n = rdbSaveLen(rdb, bit)) == -1) return C_ERR;
+        *nwritten += n;
+    }
+    return C_OK;
+}
+
+static int rdbSaveBitmapRuns(rio *rdb, const unsigned char *raw, size_t len,
+                             uint32_t runs, ssize_t *nwritten)
+{
+    uint32_t bit = 0, limit = len * 8;
+    int n;
+
+    if ((n = rdbSaveLen(rdb, runs)) == -1) return C_ERR;
+    *nwritten += n;
+    while ((bit = rdbBitmapSkipBits(raw, bit, limit, 0)) < limit) {
+        uint32_t start = bit;
+        bit = rdbBitmapSkipBits(raw, bit, limit, 1);
+        if ((n = rdbSaveLen(rdb, start)) == -1) return C_ERR;
+        *nwritten += n;
+        if ((n = rdbSaveLen(rdb, bit - start)) == -1) return C_ERR;
+        *nwritten += n;
+    }
+    return C_OK;
+}
+
+static int rdbSaveBitmapChunk(uint64_t chunk_index,
+                              const unsigned char *raw, size_t len,
+                              void *privdata)
+{
+    bitmapRDBSaveState *state = privdata;
+    uint32_t cardinality, runs;
+    size_t raw_cost, array_cost = SIZE_MAX, run_cost = SIZE_MAX;
+    uint64_t encoding;
+    int n;
+
+    rdbBitmapRawStats(raw, len, &cardinality, &runs);
+    serverAssert(cardinality != 0);
+    raw_cost = rdbBitmapLenSize(len) + len;
+
+    /* Only perform the more detailed second scan when that encoding can beat
+     * raw bytes even under its optimistic one-byte-per-value lower bound. */
+    if (rdbBitmapLenSize(cardinality) + cardinality < raw_cost)
+        array_cost = rdbBitmapArrayCost(raw, len, cardinality);
+    if (rdbBitmapLenSize(runs) + (size_t)runs * 2 < raw_cost)
+        run_cost = rdbBitmapRunCost(raw, len, runs);
+
+    if (run_cost <= array_cost && run_cost < raw_cost)
+        encoding = BITMAP_RDB_ENC_RUN;
+    else if (array_cost < raw_cost)
+        encoding = BITMAP_RDB_ENC_ARRAY;
+    else
+        encoding = BITMAP_RDB_ENC_RAW;
+
+    if ((n = rdbSaveLen(state->rdb, chunk_index)) == -1)
+        return C_ERR;
+    state->nwritten += n;
+    if ((n = rdbSaveLen(state->rdb, encoding)) == -1) return C_ERR;
+    state->nwritten += n;
+
+    if (encoding == BITMAP_RDB_ENC_ARRAY) {
+        if (rdbSaveBitmapArray(state->rdb, raw, len, cardinality,
+                               &state->nwritten) != C_OK) return C_ERR;
+    } else if (encoding == BITMAP_RDB_ENC_RUN) {
+        if (rdbSaveBitmapRuns(state->rdb, raw, len, runs,
+                             &state->nwritten) != C_OK) return C_ERR;
+    } else {
+        ssize_t saved = rdbSaveRawString(state->rdb, (unsigned char *)raw, len);
+        if (saved == -1) return C_ERR;
+        state->nwritten += saved;
+    }
+    state->chunks_written++;
+    return C_OK;
+}
+
+static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
+    bitmapRDBSaveState state = {.rdb = rdb};
+    uint64_t byte_len = bitmapObjectLen(o);
+    uint64_t chunk_count = bitmapObjectContainerCount(o);
+    ssize_t nwritten = 0;
+    int n;
+
+    if ((n = rdbSaveLen(rdb, BITMAP_RDB_FORMAT_VERSION)) == -1) return -1;
+    nwritten += n;
+    if ((n = rdbSaveLen(rdb, byte_len)) == -1) return -1;
+    nwritten += n;
+    if ((n = rdbSaveLen(rdb, chunk_count)) == -1) return -1;
+    nwritten += n;
+
+    if (bitmapObjectVisitNonEmptyChunks(o, rdbSaveBitmapChunk, &state) != C_OK)
+        return -1;
+    serverAssert(state.chunks_written == chunk_count);
+    return nwritten + state.nwritten;
+}
+
+static int rdbLoadBitmapPlainLen(rio *rdb, uint64_t *value,
+                                 const char *description)
+{
+    int isencoded;
+
+    if (rdbLoadLenByRef(rdb, &isencoded, value) == -1) {
+        rdbReportReadError("Failed loading bitmap %s", description);
+        return C_ERR;
+    }
+    if (isencoded) {
+        rdbReportCorruptRDB("Bitmap %s uses an encoded string length",
+                            description);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static int rdbLoadBitmapArray(rio *rdb, unsigned char *raw,
+                              uint32_t valid_bits)
+{
+    uint64_t count, position, previous = 0;
+
+    if (rdbLoadBitmapPlainLen(rdb, &count, "array count") != C_OK)
+        return C_ERR;
+    if (count == 0 || count > valid_bits) {
+        rdbReportCorruptRDB("Invalid bitmap array count %llu",
+                            (unsigned long long)count);
+        return C_ERR;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        if (rdbLoadBitmapPlainLen(rdb, &position, "array position") != C_OK)
+            return C_ERR;
+        if (position >= valid_bits || (i != 0 && position <= previous)) {
+            rdbReportCorruptRDB("Invalid or unordered bitmap array position %llu",
+                                (unsigned long long)position);
+            return C_ERR;
+        }
+        raw[position >> 3] |= 0x80 >> (position & 7);
+        previous = position;
+    }
+    return C_OK;
+}
+
+static int rdbLoadBitmapRuns(rio *rdb, unsigned char *raw,
+                             uint32_t valid_bits)
+{
+    uint64_t count, start, len, previous_end = 0;
+
+    if (rdbLoadBitmapPlainLen(rdb, &count, "run count") != C_OK)
+        return C_ERR;
+    if (count == 0 || count > ((uint64_t)valid_bits + 1) / 2) {
+        rdbReportCorruptRDB("Invalid bitmap run count %llu",
+                            (unsigned long long)count);
+        return C_ERR;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        if (rdbLoadBitmapPlainLen(rdb, &start, "run start") != C_OK ||
+            rdbLoadBitmapPlainLen(rdb, &len, "run length") != C_OK)
+            return C_ERR;
+        if (start >= valid_bits || len == 0 || len > valid_bits - start ||
+            (i != 0 && start <= previous_end))
+        {
+            rdbReportCorruptRDB("Invalid or overlapping bitmap run");
+            return C_ERR;
+        }
+        rdbBitmapRawSetRange(raw, start, start + len - 1);
+        previous_end = start + len;
+    }
+    return C_OK;
+}
+
+static int rdbLoadBitmapRaw(rio *rdb, unsigned char *raw, size_t expected_len) {
+    sds encoded = rdbLoadStringObjectBounded(rdb, BITMAP_RDB_CHUNK_BYTES);
+    int nonzero = 0;
+
+    if (encoded == NULL) {
+        rdbReportReadError("Failed loading bitmap raw chunk");
+        return C_ERR;
+    }
+    if (sdslen(encoded) != expected_len) {
+        rdbReportCorruptRDB("Bitmap raw chunk has length %zu, expected %zu",
+                            sdslen(encoded), expected_len);
+        sdsfree(encoded);
+        return C_ERR;
+    }
+    memcpy(raw, encoded, expected_len);
+    for (size_t i = 0; i < expected_len; i++) nonzero |= raw[i];
+    sdsfree(encoded);
+    if (!nonzero) {
+        rdbReportCorruptRDB("Bitmap raw chunk is empty");
+        return C_ERR;
+    }
+    return C_OK;
 }
 
 static robj *rdbLoadBitmapObject(rio *rdb) {
-    sds raw;
-    robj *o;
+    unsigned char raw[BITMAP_RDB_CHUNK_BYTES];
+    uint64_t version, byte_len, chunk_count, chunk_index, encoding;
+    uint64_t logical_chunks, previous_chunk = 0;
+    robj *o = NULL;
 
-    raw = rdbLoadStringObjectBounded(rdb, BITMAP_OBJECT_MAX_BYTES);
-    if (raw == NULL) return NULL;
-    o = createBitmapObjectFromString((unsigned char *)raw, sdslen(raw));
+    if (rdbLoadBitmapPlainLen(rdb, &version, "format version") != C_OK ||
+        rdbLoadBitmapPlainLen(rdb, &byte_len, "logical length") != C_OK ||
+        rdbLoadBitmapPlainLen(rdb, &chunk_count, "chunk count") != C_OK)
+        return NULL;
+    if (version != BITMAP_RDB_FORMAT_VERSION) {
+        rdbReportCorruptRDB("Unsupported bitmap RDB format version %llu",
+                            (unsigned long long)version);
+        return NULL;
+    }
+    if (byte_len > BITMAP_OBJECT_MAX_BYTES) {
+        rdbReportCorruptRDB("Bitmap logical length %llu exceeds the maximum",
+                            (unsigned long long)byte_len);
+        return NULL;
+    }
+    logical_chunks = (byte_len + BITMAP_RDB_CHUNK_BYTES - 1) /
+                     BITMAP_RDB_CHUNK_BYTES;
+    if (chunk_count > logical_chunks) {
+        rdbReportCorruptRDB("Bitmap chunk count %llu exceeds logical length",
+                            (unsigned long long)chunk_count);
+        return NULL;
+    }
+
+    o = createBitmapObjectForRDB(byte_len);
     serverAssert(o != NULL);
-    sdsfree(raw);
+    for (uint64_t i = 0; i < chunk_count; i++) {
+        uint64_t byte_offset;
+        size_t chunk_len;
+
+        if (rdbLoadBitmapPlainLen(rdb, &chunk_index, "chunk index") != C_OK ||
+            rdbLoadBitmapPlainLen(rdb, &encoding, "chunk encoding") != C_OK)
+            goto error;
+        if (chunk_index >= logical_chunks ||
+            (i != 0 && chunk_index <= previous_chunk))
+        {
+            rdbReportCorruptRDB("Invalid or unordered bitmap chunk index %llu",
+                                (unsigned long long)chunk_index);
+            goto error;
+        }
+        byte_offset = chunk_index * BITMAP_RDB_CHUNK_BYTES;
+        chunk_len = (size_t)min(BITMAP_RDB_CHUNK_BYTES,
+                                byte_len - byte_offset);
+        memset(raw, 0, chunk_len);
+
+        if (encoding == BITMAP_RDB_ENC_ARRAY) {
+            if (rdbLoadBitmapArray(rdb, raw, chunk_len * 8) != C_OK)
+                goto error;
+        } else if (encoding == BITMAP_RDB_ENC_RUN) {
+            if (rdbLoadBitmapRuns(rdb, raw, chunk_len * 8) != C_OK)
+                goto error;
+        } else if (encoding == BITMAP_RDB_ENC_RAW) {
+            if (rdbLoadBitmapRaw(rdb, raw, chunk_len) != C_OK)
+                goto error;
+        } else {
+            rdbReportCorruptRDB("Unknown bitmap chunk encoding %llu",
+                                (unsigned long long)encoding);
+            goto error;
+        }
+        if (bitmapObjectAddRDBChunk(o, chunk_index, raw, chunk_len) != C_OK) {
+            rdbReportCorruptRDB("Invalid empty bitmap chunk");
+            goto error;
+        }
+        previous_chunk = chunk_index;
+    }
+    bitmapObjectFinishRDBLoad(o);
     return o;
+
+error:
+    decrRefCount(o);
+    return NULL;
 }
 
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {

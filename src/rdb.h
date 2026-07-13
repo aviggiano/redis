@@ -81,17 +81,15 @@
 #define RDB_TYPE_STREAM_LISTPACKS_4 26        /* Stream with IDMP support */
 #define RDB_TYPE_STREAM_LISTPACKS_5 27        /* Stream with XNACK support (NACKed entries) */
 #define RDB_TYPE_ARRAY 28                     /* Array data type */
-#define RDB_TYPE_BITMAP 29                    /* Bitmap object */
-#ifdef ENABLE_GCRA
-#define RDB_TYPE_GCRA 30                      /* GCRA object */
-#endif
+#define RDB_TYPE_GCRA 29                      /* GCRA object (permanently reserved) */
+#define RDB_TYPE_BITMAP 30                    /* Bitmap object */
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType(), and rdb_type_string[] */
 
 /* Test if a type is an object type. */
 #ifdef ENABLE_GCRA
 #define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 30))
 #else
-#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 29))
+#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 28) || (t) == RDB_TYPE_BITMAP)
 #endif
 
 /* Special RDB opcodes (saved/loaded with rdbSaveType/rdbLoadType). */

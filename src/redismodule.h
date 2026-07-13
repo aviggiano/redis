@@ -90,7 +90,8 @@ typedef long long ustime_t;
 #define REDISMODULE_KEYTYPE_MODULE 6
 #define REDISMODULE_KEYTYPE_STREAM 7
 #define REDISMODULE_KEYTYPE_ARRAY 8
-#define REDISMODULE_KEYTYPE_BITMAP 9
+#define REDISMODULE_KEYTYPE_GCRA 9    /* Permanently reserved for the legacy built-in type. */
+#define REDISMODULE_KEYTYPE_BITMAP 10
 
 /* Reply types. */
 #define REDISMODULE_REPLY_UNKNOWN -1

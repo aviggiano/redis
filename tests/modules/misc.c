@@ -1,5 +1,10 @@
 #include "redismodule.h"
 
+_Static_assert(REDISMODULE_KEYTYPE_GCRA == 9,
+               "The legacy GCRA module key type ID must remain reserved");
+_Static_assert(REDISMODULE_KEYTYPE_BITMAP == 10,
+               "The native bitmap module key type ID must remain stable");
+
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
@@ -189,6 +194,7 @@ const char *test_keytype_name(int type) {
     case REDISMODULE_KEYTYPE_MODULE: return "module";
     case REDISMODULE_KEYTYPE_STREAM: return "stream";
     case REDISMODULE_KEYTYPE_ARRAY: return "array";
+    case REDISMODULE_KEYTYPE_GCRA: return "gcra";
     case REDISMODULE_KEYTYPE_BITMAP: return "bitmap";
     default: return "unknown";
     }

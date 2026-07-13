@@ -46,6 +46,10 @@ typedef enum bitmapBitop {
 void bitmapRoaringInit(void);
 robj *createBitmapObject(void);
 robj *createBitmapObjectFromString(const unsigned char *buf, size_t len);
+robj *createBitmapObjectForRDB(uint64_t byte_len);
+int bitmapObjectAddRDBChunk(robj *o, uint64_t chunk_index,
+                            const unsigned char *buf, size_t len);
+void bitmapObjectFinishRDBLoad(robj *o);
 robj *bitmapTypeDup(const robj *o);
 void freeBitmapObject(robj *o);
 void dismissBitmapObject(robj *o, size_t size_hint);
@@ -59,6 +63,12 @@ uint64_t bitmapObjectCardinality(const robj *o);
 uint64_t bitmapObjectRangeCardinality(const robj *o, uint64_t start, uint64_t end);
 typedef void bitmapObjectRangeCallback(uint64_t start, uint64_t end, void *privdata);
 void bitmapObjectVisitSetBitRanges(const robj *o, bitmapObjectRangeCallback *callback, void *privdata);
+typedef int bitmapObjectChunkCallback(uint64_t chunk_index,
+                                      const unsigned char *raw, size_t len,
+                                      void *privdata);
+int bitmapObjectVisitNonEmptyChunks(const robj *o,
+                                    bitmapObjectChunkCallback *callback,
+                                    void *privdata);
 long long bitmapObjectBitpos(const robj *o, int bit, uint64_t start, uint64_t end, int end_given);
 int bitmapObjectCanRepresentBit(uint64_t bitoffset);
 int bitmapObjectGetBit(const robj *o, uint64_t bitoffset);
@@ -67,7 +77,6 @@ uint64_t bitmapObjectGetUnsignedBitfield(const robj *o, uint64_t offset, uint64_
 int bitmapObjectSetUnsignedBitfield(robj *o, uint64_t offset, uint64_t bits, uint64_t value);
 void bitmapObjectOptimize(robj *o);
 sds bitmapObjectMaterialize(const robj *o);
-sds bitmapObjectMaterializeForRDB(const robj *o);
 robj *bitmapObjectsBitop(bitmapBitop op, robj **objects, size_t numkeys, uint64_t maxlen);
 
 #endif /* __BITMAP_ROARING_H */
