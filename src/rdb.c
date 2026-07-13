@@ -166,36 +166,39 @@ long long rdbLoadMillisecondTime(rio *rdb, int rdbver) {
 /* Saves an encoded length. The first two bits in the first byte are used to
  * hold the encoding type. See the RDB_* definitions for more information
  * on the types of encoding. */
-int rdbSaveLen(rio *rdb, uint64_t len) {
-    unsigned char buf[2];
+static size_t rdbEncodeLen(unsigned char *buf, uint64_t len) {
     size_t nwritten;
 
     if (len < (1<<6)) {
         /* Save a 6 bit len */
         buf[0] = (len&0xFF)|(RDB_6BITLEN<<6);
-        if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         nwritten = 1;
     } else if (len < (1<<14)) {
         /* Save a 14 bit len */
         buf[0] = ((len>>8)&0xFF)|(RDB_14BITLEN<<6);
         buf[1] = len&0xFF;
-        if (rdbWriteRaw(rdb,buf,2) == -1) return -1;
         nwritten = 2;
     } else if (len <= UINT32_MAX) {
         /* Save a 32 bit len */
         buf[0] = RDB_32BITLEN;
-        if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         uint32_t len32 = htonl(len);
-        if (rdbWriteRaw(rdb,&len32,4) == -1) return -1;
+        memcpy(buf + 1, &len32, sizeof(len32));
         nwritten = 1+4;
     } else {
         /* Save a 64 bit len */
         buf[0] = RDB_64BITLEN;
-        if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         len = htonu64(len);
-        if (rdbWriteRaw(rdb,&len,8) == -1) return -1;
+        memcpy(buf + 1, &len, sizeof(len));
         nwritten = 1+8;
     }
+    return nwritten;
+}
+
+int rdbSaveLen(rio *rdb, uint64_t len) {
+    unsigned char buf[9];
+    size_t nwritten = rdbEncodeLen(buf, len);
+
+    if (rdbWriteRaw(rdb,buf,nwritten) == -1) return -1;
     return nwritten;
 }
 
