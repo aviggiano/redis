@@ -111,19 +111,22 @@ CRoaring
 ---
 
 Updated source can be found here: https://github.com/RoaringBitmap/CRoaring
-Redis currently vendors CRoaring v4.7.0.
+Redis currently vendors CRoaring v4.7.2 (upstream commit
+`2e8395f1dbf286d7944a7276195a7c40cbcbfd4a`).
 
 1. Replace `deps/croaring/include` with upstream `include`.
 2. Replace `deps/croaring/src` with upstream C source/header files from `src`;
    Redis does not use upstream CMake files.
 3. Update `deps/croaring/LICENSE`, `AUTHORS`, `README.md`, and `SECURITY.md`.
 4. Check whether upstream added, removed, or renamed C sources and mirror the
-   source list in `deps/croaring/Makefile`.
+   32-bit source list in `deps/croaring/Makefile`. Redis intentionally does not
+   compile the 64-bit/ART sources while native bit offsets are capped at
+   `UINT32_MAX`.
 5. Re-apply the local Redis changes below unless upstream has independently
    fixed them; they exist to keep CI green on platforms upstream does not
    exercise the same way.
 
-Local changes compared to pristine upstream v4.7.0:
+Local changes compared to pristine upstream v4.7.2:
 
 In `include/roaring/portability.h`:
 
@@ -139,14 +142,15 @@ In `include/roaring/portability.h`:
 * Gated `CROARING_ALLOW_UNALIGNED` to
   `defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 5)`.
 
-In `src/roaring64.c` and the added `include/roaring/roaring64_internal.h`:
+In `deps/croaring/Makefile`:
 
-* Moved the private `struct roaring64_bitmap_s` definition out of
-  `roaring64.c` into the new shared internal header (plus small leaf-decoding
-  helpers) so `src/bitmap_roaring.c` can walk every allocation behind a
-  64-bit bitmap for MEMORY USAGE accounting, fork-child page dismissal and
-  active defragmentation, exactly like it does for the 32-bit
-  `roaring_bitmap_t` whose layout upstream exposes publicly. The long-term
-  plan is to propose an allocation-visitor/relocation helper API to upstream
-  CRoaring so future version bumps do not depend on this internal header.
+* Compiled all vendored objects with `-fvisibility=hidden`. The Redis server
+  additionally links this archive with GNU ld's `--exclude-libs` on Linux and
+  verifies that no archive-defined symbol appears in its dynamic symbol table.
+  This is required because Redis uses `-rdynamic` for modules, while CRoaring's
+  allocator hook is process-global; exposing the vendored copy would let a
+  module embedding CRoaring bind to and overwrite Redis' allocator state.
 
+Set `REDIS_ROARING_MODULE=/path/to/libredis-roaring.so` when running
+`./runtest --single unit/bitmap-native` to exercise coexistence with a module
+that embeds its own CRoaring copy, including module load, defrag and lazy-free.

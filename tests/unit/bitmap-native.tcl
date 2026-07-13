@@ -4,6 +4,14 @@ set testmodule [file normalize tests/modules/misc.so]
 set ::sparse_public_offset 65536
 set ::sparse_public_len 8193
 
+proc wait_for_bitmap_defrag_stop {maxtries delay} {
+    wait_for_condition $maxtries $delay {
+        [s active_defrag_running] eq 0
+    } else {
+        fail "bitmap defrag did not stop"
+    }
+}
+
 start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
     test {bitmap-default-native defaults to no} {
         assert_equal no [lindex [r config get bitmap-default-native] 1]
@@ -876,7 +884,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         append mixed [string repeat [binary format H* ff] 600]
 
         # An array-only bitmap spanning two containers keeps sparse data valid
-        # across more than one high48 bucket.
+        # across more than one high16 container.
         set sparse [binary format H* 80]
         append sparse [string repeat [binary format H* 00] 8191]
         append sparse [binary format H* 80]
@@ -943,6 +951,7 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         }
         r config set bitmap-default-native no
         assert_equal [r type bitmap:lazy] bitmap
+        assert_equal 80 [r debug bitmap-container-count bitmap:lazy]
 
         assert_equal [r unlink bitmap:lazy] 1
         wait_for_condition 50 100 {
@@ -952,6 +961,132 @@ start_server {tags {"bitmap" "bitmap-native" "needs:debug" "cluster:skip"}} {
         }
         assert_equal [s lazyfreed_objects] 1
     } {} {needs:config-resetstat}
+
+    if {$::debug_defrag} {
+        test {forced active defrag relocates dense bitmap BITSET storage safely} {
+            r flushdb
+            r config set bitmap-default-native no
+            r config set activedefrag no
+            wait_for_bitmap_defrag_stop 500 10
+            r config resetstat
+
+            # Alternating bits exceed ARRAY capacity and cannot be compressed
+            # usefully as runs, forcing a BITSET container with an independently
+            # aligned words allocation.
+            set dense [string repeat [binary format H* aa] 8192]
+            r set bitmap:defrag:dense $dense
+            convert_string_bitmap_to_native r bitmap:defrag:dense
+            assert_equal bitmap [r type bitmap:defrag:dense]
+            assert_equal 32768 [r bitcount bitmap:defrag:dense]
+            assert_morethan [r memory usage bitmap:defrag:dense] 8192
+
+            r config set hz 100
+            r config set active-defrag-threshold-lower 1
+            r config set active-defrag-cycle-min 65
+            r config set active-defrag-cycle-max 75
+            r config set active-defrag-ignore-bytes 1
+            r config set activedefrag yes
+
+            wait_for_condition 500 10 {
+                [s active_defrag_key_hits] > 0
+            } else {
+                puts [r info memory]
+                puts [r info stats]
+                fail "forced defrag did not relocate the dense bitmap"
+            }
+
+            r config set activedefrag no
+            wait_for_bitmap_defrag_stop 500 10
+            assert_equal bitmap [r type bitmap:defrag:dense]
+            assert_equal 32768 [r bitcount bitmap:defrag:dense]
+            assert_equal $dense [r debug bitmap-raw bitmap:defrag:dense]
+            assert_equal 1 [r del bitmap:defrag:dense]
+        } {} {needs:config-resetstat}
+    }
+
+    if {[info exists ::env(REDIS_ROARING_MODULE)]} {
+        test {native bitmap coexists with an independently linked redis-roaring module} {
+            set module [file normalize $::env(REDIS_ROARING_MODULE)]
+            if {![file exists $module]} {
+                fail "REDIS_ROARING_MODULE does not exist: $module"
+            }
+
+            r flushdb
+            r config resetstat
+            r config set bitmap-default-native yes
+
+            # Keep a native allocation alive across module load, then create
+            # more native allocations after the module installs its own
+            # CRoaring allocator hook. Both orders must remain isolated.
+            assert_equal 0 [r setbit coexist:core-before 65535 1]
+            set dense [string repeat [binary format H* aa] 8192]
+            r set coexist:core-dense $dense
+            convert_string_bitmap_to_native r coexist:core-dense
+            assert_equal OK [r module load $module]
+            assert_equal 0 [r setbit coexist:core-after 131071 1]
+            for {set i 0} {$i < 80} {incr i} {
+                r setbit coexist:core-lazy [expr {$i * 65536}] 1
+            }
+
+            assert_equal 1 [r getbit coexist:core-before 65535]
+            assert_equal 1 [r getbit coexist:core-after 131071]
+            assert_equal 80 [r debug bitmap-container-count coexist:core-lazy]
+            assert_morethan [r memory usage coexist:core-before] 0
+            assert_morethan [r memory usage coexist:core-after] 0
+
+            assert_equal 0 [r r.setbit coexist:r32 123456 1]
+            assert_equal 1 [r r.getbit coexist:r32 123456]
+            assert_equal 0 [r r64.setbit coexist:r64 4294967297 1]
+            assert_equal 1 [r r64.getbit coexist:r64 4294967297]
+            assert_morethan [r memory usage coexist:r32] 0
+            assert_morethan [r memory usage coexist:r64] 0
+
+            if {$::debug_defrag} {
+                # Relocate a core BITSET while the independently linked module
+                # is loaded. This catches allocator interposition during the
+                # most sensitive ownership transition, not just at free time.
+                r config set activedefrag no
+                wait_for_bitmap_defrag_stop 500 10
+                r config set hz 100
+                r config set active-defrag-threshold-lower 1
+                r config set active-defrag-cycle-min 65
+                r config set active-defrag-cycle-max 75
+                r config set active-defrag-ignore-bytes 1
+                set dense_ptr [lindex [split [r debug object coexist:core-dense]] 1]
+                r config set activedefrag yes
+                wait_for_condition 500 10 {
+                    [lindex [split [r debug object coexist:core-dense]] 1] ne $dense_ptr
+                } else {
+                    fail "coexistence defrag did not relocate the core bitmap"
+                }
+                r config set activedefrag no
+                wait_for_bitmap_defrag_stop 500 10
+
+                assert_equal $dense [r debug bitmap-raw coexist:core-dense]
+                assert_equal 1 [r getbit coexist:core-before 65535]
+                assert_equal 1 [r getbit coexist:core-after 131071]
+                assert_equal 1 [r r.getbit coexist:r32 123456]
+                assert_equal 1 [r r64.getbit coexist:r64 4294967297]
+            }
+
+            assert_equal 1 [r unlink coexist:core-lazy]
+            wait_for_condition 50 100 {
+                [s lazyfree_pending_objects] == 0
+            } else {
+                fail "coexistence lazyfree did not finish"
+            }
+            assert_equal 1 [s lazyfreed_objects]
+
+            assert_equal 5 [r del coexist:core-before coexist:core-dense coexist:core-after coexist:r32 coexist:r64]
+
+            # redis-roaring exports data types and therefore cannot be unloaded;
+            # keep exercising core allocations until the test server shuts down.
+            assert_equal 0 [r setbit coexist:core-after-delete 7 1]
+            assert_equal 1 [r getbit coexist:core-after-delete 7]
+            assert_equal 1 [r del coexist:core-after-delete]
+            assert_equal OK [r config set bitmap-default-native no]
+        } {} {needs:config-resetstat}
+    }
 
     test {public-created native bitmaps survive debug reload} {
         r config set bitmap-default-native yes

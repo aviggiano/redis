@@ -8,14 +8,14 @@ AR ?= ar
 ARFLAGS = rcs
 
 CROARING_CFLAGS = $(STD) $(WARN) $(OPT) $(ENABLE_LTO) $(CFLAGS) -fPIC \
-	-DROARING_DISABLE_X64=1 -DDISABLENEON=1 -Iinclude -Isrc
+	-fvisibility=hidden -DROARING_DISABLE_X64=1 -DDISABLENEON=1 \
+	-Iinclude -Isrc
 CROARING_BUILD_SETTINGS = .make-build-settings
 
 ROARING_SRC = \
 	src/isadetection.c \
 	src/array_util.c \
 	src/bitset_util.c \
-	src/art/art.c \
 	src/bitset.c \
 	src/containers/array.c \
 	src/containers/bitset.c \
@@ -31,7 +31,6 @@ ROARING_SRC = \
 	src/containers/run.c \
 	src/memory.c \
 	src/roaring.c \
-	src/roaring64.c \
 	src/roaring_priority_queue.c \
 	src/roaring_array.c
 

@@ -1275,6 +1275,7 @@ run_solo {defrag} {
 
             convert_string_bitmap_to_native r bigbitmap1
             assert_equal bitmap [r type bigbitmap1]
+            assert_equal $containers [r debug bitmap-container-count bigbitmap1]
 
             # Free every other copied bitmap to punch holes into the
             # container size classes.

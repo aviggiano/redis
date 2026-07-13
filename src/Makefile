@@ -153,6 +153,31 @@ FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(REDIS_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm
 DEBUG=-g -ggdb
+NM?=nm
+
+# Redis uses -rdynamic on Linux for module support. Keep the statically linked
+# CRoaring implementation private so a module that embeds another CRoaring
+# version cannot bind to Redis' copy or replace its process-global memory hook.
+ifeq ($(uname_S),Linux)
+CROARING_SERVER_LDFLAGS=-Wl,--exclude-libs,libroaring.a
+define VERIFY_CROARING_SYMBOLS
+	@set -e; \
+	archive_symbols="$@.croaring-archive-symbols.$$$$"; \
+	dynamic_symbols="$@.croaring-dynamic-symbols.$$$$"; \
+	leaked_symbols="$@.croaring-leaked-symbols.$$$$"; \
+	trap 'rm -f "$$archive_symbols" "$$dynamic_symbols" "$$leaked_symbols"' EXIT HUP INT TERM; \
+	$(NM) -g --defined-only ../deps/croaring/libroaring.a | \
+		awk 'NF >= 2 { print $$NF }' | LC_ALL=C sort -u > "$$archive_symbols"; \
+	$(NM) -D -g --defined-only $@ | \
+		awk 'NF >= 2 { print $$NF }' | LC_ALL=C sort -u > "$$dynamic_symbols"; \
+	LC_ALL=C comm -12 "$$archive_symbols" "$$dynamic_symbols" > "$$leaked_symbols"; \
+	if test -s "$$leaked_symbols"; then \
+		echo "ERROR: redis-server exports vendored CRoaring symbols:" >&2; \
+		sed 's/^/  /' "$$leaked_symbols" >&2; \
+		exit 1; \
+	fi
+endef
+endif
 
 # Linux ARM32 needs -latomic at linking time
 ifneq (,$(findstring armv,$(uname_M)))
@@ -445,7 +470,8 @@ endif
 
 # redis-server
 $(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/xxhash/libxxhash.a ../deps/tre/libtre.a ../deps/croaring/libroaring.a $(FINAL_LIBS)
+	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/xxhash/libxxhash.a ../deps/tre/libtre.a $(CROARING_SERVER_LDFLAGS) ../deps/croaring/libroaring.a $(FINAL_LIBS)
+	$(VERIFY_CROARING_SYMBOLS)
 
 # redis-sentinel
 $(REDIS_SENTINEL_NAME): $(REDIS_SERVER_NAME)
