@@ -8,6 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "bitmap_roaring.h"
 #include "crc64.h"
 #include "dict.h"
 #include "mt19937-64.h"
@@ -52,6 +53,7 @@ void redisFuzzInit(void) {
     dictSetHashFunctionSeed(hashseed);
 
     initServerConfig();
+    bitmapRoaringInit();
     resetServerSaveParams();
     server.port = 0;
     server.tls_port = 0;

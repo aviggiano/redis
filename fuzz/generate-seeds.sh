@@ -109,6 +109,12 @@ printf '\x00\x07\x00' \
 printf '3G AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH?HAECAG BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBICAGFHI\n' \
     > "$BITMAP_DIR/seed16_string_conversion_mixed_bitop"
 
+# Regression input from the first Roaring fuzz CI campaign. It reaches an
+# aligned CRoaring allocation through a stateful BITOP sequence and verifies
+# that the fuzz harness installs the same allocator hooks as Redis startup.
+printf '\x3c\x05\xa2\xa2\xa2\xa2\xff\xff\xa2\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\xff\xff\xa6\xa6\xa6\xa6\xa6\xa6\xa6\xa6\xa6\xfd\xa6\xa6\xfd\xa6\xa4\xa6\xa6\xa6\x00\xff\xff\xff\x03\x00\x6f\x73\xa2\x00\x03\x01\x6e\x6f\x70' \
+    > "$BITMAP_DIR/seed17_aligned_allocator_bitop"
+
 echo "Seed files generated:"
 echo "  string_commands: $(find "$STRING_DIR" -type f | wc -l | tr -d ' ')"
 echo "  bitmap_commands: $(find "$BITMAP_DIR" -type f | wc -l | tr -d ' ')"
