@@ -104,6 +104,11 @@ printf '\x00\x06\x00\x00\x00\x03\x01\x05' \
 printf '\x00\x07\x00' \
     > "$BITMAP_DIR/seed15_invalid_bitop_shape"
 
+# Stateful representation path: SET k0 to a string; SETBIT converts k0 to
+# Roaring; SET k1 remains a string; BITOP OR consumes the mixed source types.
+printf '3G AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH?HAECAG BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBICAGFHI\n' \
+    > "$BITMAP_DIR/seed16_string_conversion_mixed_bitop"
+
 echo "Seed files generated:"
 echo "  string_commands: $(find "$STRING_DIR" -type f | wc -l | tr -d ' ')"
 echo "  bitmap_commands: $(find "$BITMAP_DIR" -type f | wc -l | tr -d ' ')"

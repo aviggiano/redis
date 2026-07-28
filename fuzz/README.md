@@ -1,12 +1,13 @@
 # Redis fuzzing
 
-This directory contains opt-in libFuzzer targets for Redis core. The initial
-targets exercise Redis string and string-backed bitmap commands through the real
-command parser and executor, using a local socketpair-backed client.
+This directory contains opt-in libFuzzer targets for Redis core. The targets
+exercise Redis string and bitmap commands through the real command parser and
+executor, using a local socketpair-backed client.
 
-The targets are intentionally independent from native bitmap work. Once this
-infrastructure lands upstream, native bitmap targets can extend it in the
-feature branch.
+The bitmap target enables `bitmap-default-roaring` and also generates ordinary
+`SET` commands. Stateful inputs therefore cover string-to-Roaring conversion and
+mixed string/Roaring bitmap operations. The generic string target retains the
+default Redis configuration.
 
 ## Build
 

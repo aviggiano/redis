@@ -15,6 +15,15 @@ static void append_overflow(sds *resp, RedisFuzzInput *in) {
     redisFuzzAppendBulkCString(resp, modes[redisFuzzChoice(in, sizeof(modes) / sizeof(modes[0]))]);
 }
 
+static void append_set(sds *resp, RedisFuzzInput *in) {
+    sds value = redisFuzzSlice(in, 64);
+    redisFuzzAppendArray(resp, 3);
+    redisFuzzAppendBulkCString(resp, "SET");
+    redisFuzzAppendKey(resp, in);
+    redisFuzzAppendBulkSds(resp, value);
+    sdsfree(value);
+}
+
 static void append_setbit(sds *resp, RedisFuzzInput *in) {
     redisFuzzAppendArray(resp, 4);
     redisFuzzAppendBulkCString(resp, "SETBIT");
@@ -131,7 +140,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     int commands = 1 + (int)redisFuzzChoice(&in, 16);
 
     for (int i = 0; i < commands; i++) {
-        switch (redisFuzzChoice(&in, 8)) {
+        switch (redisFuzzChoice(&in, 9)) {
         case 0: append_setbit(&resp, &in); break;
         case 1: append_getbit(&resp, &in); break;
         case 2: append_bitcount(&resp, &in); break;
@@ -139,10 +148,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case 4: append_bitop(&resp, &in); break;
         case 5: append_bitfield(&resp, &in, 0); break;
         case 6: append_bitfield(&resp, &in, 1); break;
-        default: append_invalid_bitmap_shape(&resp, &in); break;
+        case 7: append_invalid_bitmap_shape(&resp, &in); break;
+        default: append_set(&resp, &in); break;
         }
     }
 
+    redisFuzzInit();
+    server.bitmap_default_roaring = 1;
     redisFuzzRunResp(resp);
     return 0;
 }
