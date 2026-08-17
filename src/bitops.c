@@ -1535,8 +1535,18 @@ static void bitopCommandBitmap(client *c, bitroarOp op, robj *targetkey,
 {
     robj *res_bitmap = NULL;
 
-    if (op == BITOP_NOT && maxlen > BITROAR_BITOP_NOT_MAX_BYTES) {
-        addReplyError(c, "BITOP NOT result exceeds 512 MiB Roaring bitmap limit");
+    /* Complementing a borrowed Roaring source materializes every 2^16-bit
+     * chunk of the logical range, so bound it for interactive clients. Owned
+     * string sources are exempt: they complement their own buffer at a cost
+     * proportional to their size. Replicated and AOF-loaded commands are
+     * never rejected either, since a primary may legitimately have computed
+     * a larger result before this limit existed: erroring here would panic
+     * AOF loading and silently diverge a replica from its primary. */
+    if (op == BITOP_NOT && maxlen > BITROAR_BITOP_NOT_MAX_BYTES &&
+        objects[0]->type == OBJ_BITMAP && !mustObeyClient(c)) {
+        addReplyErrorFormat(c,
+            "BITOP NOT result exceeds %llu MiB Roaring bitmap limit",
+            (unsigned long long)(BITROAR_BITOP_NOT_MAX_BYTES >> 20));
         return;
     }
 

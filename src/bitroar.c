@@ -1637,7 +1637,12 @@ static roaring64_bitmap_t *bitroarExactlyOneOpSources(bitroarOpSource *sources,
  * as a new Roaring bitmap object whose logical length is 'maxlen', matching the
  * string semantics where the destination length equals the longest source.
  * Sparse, large and Roaring-only operations stay entirely in Roaring space;
- * bounded dense mixed operands use the raw-word path above. */
+ * bounded dense mixed operands use the raw-word path above.
+ *
+ * BITOP NOT above BITROAR_BITOP_NOT_MAX_BYTES is a policy decision made by
+ * the caller, not re-checked here: BITOP rejects it for interactive clients
+ * with a borrowed Roaring source, while string sources and AOF or primary
+ * replay may legitimately exceed it. */
 robj *bitroarApplyOp(bitroarOp op, robj **objects, size_t numkeys,
                      uint64_t maxlen)
 {
@@ -1648,7 +1653,6 @@ robj *bitroarApplyOp(bitroarOp op, robj **objects, size_t numkeys,
 
     serverAssert(numkeys > 0);
     serverAssert(maxlen <= BITROAR_MAX_BYTES);
-    serverAssert(op != BITOP_NOT || maxlen <= BITROAR_BITOP_NOT_MAX_BYTES);
 
     if (bitroarUseMixedRawOp(objects, numkeys, maxlen)) {
         result = bitroarApplyMixedRawOp(op, objects, numkeys,

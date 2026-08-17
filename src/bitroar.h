@@ -36,7 +36,14 @@
  * Bound that synchronous work to 2^16 chunks (512 MiB) so a compact bitmap
  * with a high logical length cannot amplify into unbounded allocations. This
  * fixed limit is independent of proto-max-bulk-len, which may be changed after
- * a value is created and may differ while commands are replayed. */
+ * a value is created and may differ while commands are replayed.
+ *
+ * BITOP enforces the limit only for borrowed Roaring sources: an owned string
+ * source complements its own buffer at a cost bounded by its size. Commands
+ * replayed from the AOF or a primary are exempt so histories recorded before
+ * the limit keep reproducing the same dataset. The client-visible error
+ * message derives its MiB figure from this macro; redis.conf documents the
+ * same value in prose and must be kept in sync when retuning it. */
 #define BITROAR_BITOP_NOT_MAX_BYTES (512ULL * 1024 * 1024)
 
 /* Bitwise operations supported by bitroarApplyOp() (the BITOP command). */

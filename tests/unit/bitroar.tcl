@@ -1381,6 +1381,57 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "external:skip" "clu
         assert_equal bitmap [r type bitmap:aof-incr:bitop:out]
         assert_equal [binary format H* ff] [r debug bitmap-raw bitmap:aof-incr:bitop:out]
     }
+
+    test {Over-limit BITOP NOT replayed from the AOF is honored, not rejected} {
+        set not_limit [expr {512 * 1024 * 1024}]
+        set not_limit_err "ERR BITOP NOT result exceeds [expr {$not_limit >> 20}] MiB Roaring bitmap limit"
+        set byte_len [expr {$not_limit + 1}]
+        set bit_len [expr {$byte_len * 8}]
+
+        # Build a compact over-limit Roaring source the way a pre-limit
+        # primary could have: a high logical length with no set bits. Keep
+        # proto-max-bulk-len raised so the high-offset reads below stay legal;
+        # the NOT limit itself is independent of that config.
+        r config set proto-max-bulk-len $byte_len
+        r config set bitmap-default-roaring yes
+        r del bitop:not:aof:seed bitop:not:aof:src bitop:not:aof:dest \
+            bitop:not:aof:front
+        assert_equal 0 [r setbit bitop:not:aof:seed [expr {$bit_len - 1}] 0]
+        set payload [r dump bitop:not:aof:seed]
+        r del bitop:not:aof:seed
+        r config set bitmap-default-roaring no
+        r restore bitop:not:aof:src 0 $payload
+        assert_equal bitmap [r type bitop:not:aof:src]
+
+        # An interactive client is still rejected up front...
+        assert_error $not_limit_err {
+            r bitop not bitop:not:aof:front bitop:not:aof:src
+        }
+        assert_equal 0 [r exists bitop:not:aof:front]
+
+        # ...but the same command recorded by a pre-limit server must replay:
+        # the AOF loading client obeys unconditionally, exactly like a replica
+        # applying its primary's stream. Rejecting it would panic the server
+        # while loading the AOF (an error reply to the AOF client aborts) and
+        # would silently desync a replica.
+        set aof [get_last_incr_aof_path r]
+        set fp [open $aof a]
+        fconfigure $fp -translation binary
+        puts -nonewline $fp \
+            [format_command bitop not bitop:not:aof:dest bitop:not:aof:src]
+        close $fp
+        r debug loadaof
+
+        assert_equal bitmap [r type bitop:not:aof:dest]
+        assert_equal $bit_len [r bitcount bitop:not:aof:dest]
+        assert_equal 1 [r getbit bitop:not:aof:dest 0]
+        assert_equal 1 [r getbit bitop:not:aof:dest [expr {$bit_len - 1}]]
+        assert_lessthan [r memory usage bitop:not:aof:dest] \
+            [expr {16 * 1024 * 1024}]
+
+        r del bitop:not:aof:src bitop:not:aof:dest
+        set _ {}
+    } {} {config:restore}
 }
 
 start_server {tags {"bitmap" "bitmap-roaring" "repl" "external:skip" "cluster:skip"}} {
@@ -2500,6 +2551,7 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
 
     test {BITOP NOT bounds work for compact high-length Roaring bitmaps} {
         set not_limit [expr {512 * 1024 * 1024}]
+        set not_limit_err "ERR BITOP NOT result exceeds [expr {$not_limit >> 20}] MiB Roaring bitmap limit"
         set byte_len [expr {$not_limit + 1}]
         set last_bit [expr {$byte_len * 8 - 1}]
         r config set proto-max-bulk-len $byte_len
@@ -2532,7 +2584,7 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
 
         r set bitop:not:roaring:huge:dest keep
         set dirty [s rdb_changes_since_last_save]
-        assert_error {ERR BITOP NOT result exceeds 512 MiB Roaring bitmap limit} {
+        assert_error $not_limit_err {
             r bitop not bitop:not:roaring:huge:dest bitop:not:roaring:huge
         }
         assert_equal keep [r get bitop:not:roaring:huge:dest]
@@ -2540,7 +2592,7 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
 
         # Aliasing is rejected before the source can be replaced. Other BITOPs
         # retain wide sparse support and preserve the compact logical length.
-        assert_error {ERR BITOP NOT result exceeds 512 MiB Roaring bitmap limit} {
+        assert_error $not_limit_err {
             r bitop not bitop:not:roaring:huge bitop:not:roaring:huge
         }
         assert_equal $byte_len [r bitop or bitop:not:roaring:huge:copy \
@@ -3375,4 +3427,33 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "needs:save" "cluste
 
         r del bitmap:checkrdb:sparse bitmap:checkrdb:dense
     }
+}
+
+start_server {tags {"bitmap" "bitmap-roaring" "large-memory" "cluster:skip"}} {
+    test {BITOP NOT over the Roaring limit still works for plain string sources} {
+        set not_limit [expr {512 * 1024 * 1024}]
+        set byte_len [expr {$not_limit + 1}]
+        r config set proto-max-bulk-len [expr {$byte_len + 16}]
+        r config set bitmap-default-roaring yes
+        r del bitop:not:string:src bitop:not:string:dest
+
+        # An over-limit string source already occupies memory proportional to
+        # its complement, so the Roaring NOT chunk limit must not reject it
+        # even though the destination defaults to a Roaring bitmap.
+        assert_equal $byte_len [r setrange bitop:not:string:src \
+            [expr {$byte_len - 1}] [binary format H* 80]]
+        assert_equal string [r type bitop:not:string:src]
+
+        assert_equal $byte_len [r bitop not bitop:not:string:dest \
+            bitop:not:string:src]
+        assert_equal bitmap [r type bitop:not:string:dest]
+        assert_equal 1 [r getbit bitop:not:string:dest 0]
+        assert_equal 0 [r getbit bitop:not:string:dest \
+            [expr {($byte_len - 1) * 8}]]
+        assert_equal [expr {$byte_len * 8 - 1}] \
+            [r bitcount bitop:not:string:dest]
+
+        r del bitop:not:string:src bitop:not:string:dest
+        set _ {}
+    } {} {config:restore}
 }
