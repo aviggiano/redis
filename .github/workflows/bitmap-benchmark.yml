@@ -65,6 +65,12 @@ jobs:
           echo "MODULE_HOST_REDIS_REF=${{ inputs.module_host_redis_ref }}" >> "$GITHUB_ENV"
           echo "REDIS_ROARING_REF=${{ inputs.redis_roaring_ref }}" >> "$GITHUB_ENV"
 
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+
       - name: Checkout baseline
         uses: actions/checkout@v6
         with:
@@ -100,6 +106,7 @@ jobs:
 
       - name: Record checked-out SHAs
         run: |
+          harness_sha="$(git -C harness rev-parse HEAD)"
           before_sha="$(git -C before rev-parse HEAD)"
           before_native_sha=""
           if [ -d before-native ]; then
@@ -108,6 +115,7 @@ jobs:
           after_sha="$(git -C after rev-parse HEAD)"
           module_host_sha="$(git -C module-host rev-parse HEAD)"
           redis_roaring_sha="$(git -C redis-roaring rev-parse HEAD)"
+          echo "HARNESS_SHA=$harness_sha" >> "$GITHUB_ENV"
           echo "BEFORE_SHA=$before_sha" >> "$GITHUB_ENV"
           echo "BEFORE_NATIVE_SHA=$before_native_sha" >> "$GITHUB_ENV"
           echo "AFTER_SHA=$after_sha" >> "$GITHUB_ENV"
@@ -153,6 +161,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/bitmap-bench-results"
           {
             echo "runner_label=${{ inputs.runner_label }}"
+            echo "harness_sha=$HARNESS_SHA"
             echo "baseline_redis_ref_input=$BASELINE_REDIS_REF"
             echo "before_sha=$BEFORE_SHA"
             echo "baseline_native_redis_ref_input=$BASELINE_NATIVE_REDIS_REF"
@@ -178,7 +187,7 @@ jobs:
           if [ -n "$BASELINE_NATIVE_REDIS_REF" ]; then
             before_native_args=(--compare-before-native-src-dir "$GITHUB_WORKSPACE/before-native/src")
           fi
-          python3 tools/bitmap-bench.py \
+          python3 "$GITHUB_WORKSPACE/harness/tools/bitmap-bench.py" \
             --compare-before-src-dir "$GITHUB_WORKSPACE/before/src" \
             "${before_native_args[@]}" \
             --compare-after-src-dir "$GITHUB_WORKSPACE/after/src" \
