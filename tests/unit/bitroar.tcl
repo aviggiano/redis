@@ -1208,16 +1208,29 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
         r config set proto-max-bulk-len $oldval
     }
 
-    test {Roaring bitmap unlink uses lazyfree for many roaring containers} {
+    test {Roaring bitmap lazyfree preserves the container-count threshold} {
         r config resetstat
         r config set bitmap-default-roaring yes
-        for {set i 0} {$i < 80} {incr i} {
-            r setbit bitmap:lazy [expr {$i * 65536}] 1
+
+        # 31 containers have an estimated effort of exactly 64, so freeing
+        # remains synchronous at the strict greater-than threshold.
+        for {set i 0} {$i < 31} {incr i} {
+            r setbit bitmap:lazy:sync [expr {$i * 65536}] 1
+        }
+        assert_equal bitmap [r type bitmap:lazy:sync]
+        assert_equal 1 [r unlink bitmap:lazy:sync]
+        assert_equal 0 [s lazyfree_pending_objects]
+        assert_equal 0 [s lazyfreed_objects]
+
+        # The 32nd container raises the estimated effort to 66 and queues the
+        # object for lazyfree. The bounded count must still observe this edge.
+        for {set i 0} {$i < 32} {incr i} {
+            r setbit bitmap:lazy:async [expr {$i * 65536}] 1
         }
         r config set bitmap-default-roaring no
-        assert_equal [r type bitmap:lazy] bitmap
+        assert_equal bitmap [r type bitmap:lazy:async]
 
-        assert_equal [r unlink bitmap:lazy] 1
+        assert_equal 1 [r unlink bitmap:lazy:async]
         wait_for_condition 50 100 {
             [s lazyfree_pending_objects] == 0
         } else {
