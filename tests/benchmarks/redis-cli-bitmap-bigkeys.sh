@@ -10,14 +10,15 @@ fi
 server_bin=$(realpath "$1")
 cli_bin=$(realpath "$2")
 keys=${BITMAP_BENCH_KEYS:-20000}
-port=${BITMAP_BENCH_PORT:-16341}
+shape_keys=${BITMAP_BENCH_SHAPE_KEYS:-1000}
 bench_dir=$(mktemp -d)
 pidfile="$bench_dir/redis.pid"
 logfile="$bench_dir/redis.log"
+socket="$bench_dir/redis.sock"
 
 cleanup() {
-    "$cli_bin" -p "$port" shutdown nosave >/dev/null 2>&1 || true
     if [[ -f "$pidfile" ]]; then
+        "$cli_bin" -s "$socket" shutdown nosave >/dev/null 2>&1 || true
         kill "$(<"$pidfile")" >/dev/null 2>&1 || true
     fi
     rm -rf "$bench_dir"
@@ -25,8 +26,9 @@ cleanup() {
 trap cleanup EXIT
 
 "$server_bin" \
-    --port "$port" \
-    --bind 127.0.0.1 \
+    --port 0 \
+    --unixsocket "$socket" \
+    --unixsocketperm 700 \
     --save '' \
     --appendonly no \
     --daemonize yes \
@@ -37,7 +39,7 @@ trap cleanup EXIT
 
 ready=0
 for _ in $(seq 1 100); do
-    if "$cli_bin" -p "$port" ping >/dev/null 2>&1; then
+    if [[ -f "$pidfile" ]] && "$cli_bin" -s "$socket" ping >/dev/null 2>&1; then
         ready=1
         break
     fi
@@ -48,18 +50,23 @@ if (( ready == 0 )); then
     exit 1
 fi
 
-# Populate one-bit native bitmaps, then make the final key eight bits wide.
-# Fixture creation is deliberately outside the measured region.
+# Populate one-bit native bitmaps, give a subset 32 sparse containers, then
+# make the final key eight bits wide. Fixture creation is outside the measured
+# region. The sparse subset catches BITCOUNT cost that scales with containers.
 {
     seq 1 "$keys" | awk '{printf "SETBIT bitmap:%d 0 1\r\n", $1}'
+    seq 1 "$shape_keys" | awk '{
+        for (container = 1; container < 32; container++)
+            printf "SETBIT bitmap:%d %d 1\r\n", $1, container * 65536
+    }'
     for bit in $(seq 1 7); do
         printf 'SETBIT bitmap:%s %s 1\r\n' "$keys" "$bit"
     done
 } |
-    "$cli_bin" -p "$port" --pipe >/dev/null
+    "$cli_bin" -s "$socket" --pipe >/dev/null
 
 start_ns=$(date +%s%N)
-output=$("$cli_bin" -p "$port" --bigkeys)
+output=$("$cli_bin" -s "$socket" --bigkeys)
 end_ns=$(date +%s%N)
 elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
@@ -76,5 +83,6 @@ if [[ ! "$bitmap_count" =~ ^[0-9]+$ || ! "$bitmap_total" =~ ^[0-9]+$ || -z "$uni
     exit 1
 fi
 
-printf 'elapsed_ms=%s bitmap_count=%s bitmap_total=%s unit=%s\n' \
-    "$elapsed_ms" "$bitmap_count" "$bitmap_total" "$unit"
+expected_total=$((keys + shape_keys * 31 + 7))
+printf 'elapsed_ms=%s bitmap_count=%s bitmap_total=%s unit=%s expected_total=%s\n' \
+    "$elapsed_ms" "$bitmap_count" "$bitmap_total" "$unit" "$expected_total"
