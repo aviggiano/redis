@@ -9996,7 +9996,7 @@ static void findBigKeys(int memkeys, long long memkeys_samples) {
             totlen += keys->element[i]->len;
             sampled++;
 
-            if(!type->biggest_key || type->biggest<sizes[i]) {
+            if(type->biggest<sizes[i] || (!type->biggest_key && type->sizecmd)) {
                 /* Keep track of biggest key name for this type */
                 if (type->biggest_key)
                     sdsfree(type->biggest_key);
@@ -11087,7 +11087,7 @@ static void updateKeyType(redisReply *element, unsigned long long size, typeinfo
     type->totalsize += size;
     type->count++;
 
-    if (!type->biggest_key || type->biggest<size) {
+    if (type->biggest<size || (!type->biggest_key && type->sizecmd)) {
         /* Keep track of biggest key name for this type */
         if (type->biggest_key)
             sdsfree(type->biggest_key);
