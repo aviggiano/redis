@@ -18,8 +18,10 @@ socket="$bench_dir/redis.sock"
 
 cleanup() {
     if [[ -f "$pidfile" ]]; then
-        "$cli_bin" -s "$socket" shutdown nosave >/dev/null 2>&1 || true
-        kill "$(<"$pidfile")" >/dev/null 2>&1 || true
+        pid=$(<"$pidfile")
+        if ! "$cli_bin" -s "$socket" shutdown nosave >/dev/null 2>&1; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
     fi
     rm -rf "$bench_dir"
 }
