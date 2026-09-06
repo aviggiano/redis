@@ -36,10 +36,10 @@ jobs:
 
       - name: Compare sparse-bitmap UNLINK latency
         run: |
-          base_result=$(BITMAP_BENCH_PORT=16331 tests/benchmarks/bitmap-container-count.sh \
+          base_result=$(tests/benchmarks/bitmap-container-count.sh \
             /tmp/redis-benchmark-base/src/redis-server \
             /tmp/redis-benchmark-base/src/redis-cli)
-          head_result=$(BITMAP_BENCH_PORT=16332 tests/benchmarks/bitmap-container-count.sh \
+          head_result=$(tests/benchmarks/bitmap-container-count.sh \
             "$PWD/src/redis-server" "$PWD/src/redis-cli")
 
           base_us=$(sed -n 's/.*duration_us=\([0-9][0-9]*\).*/\1/p' <<<"$base_result")
