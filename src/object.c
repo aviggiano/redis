@@ -25,6 +25,14 @@
 
 static_assert(sizeof(kvBits) == 1, "kvBits must be a single byte");
 
+/* type:4, encoding:4, refcount:23 and iskvobj:1 share one 32-bit word. Every
+ * encoding must fit in 4 bits: widening 'encoding' would take a bit from
+ * 'refcount' and halve the refcount at which incrRefCount() panics. */
+static_assert(OBJ_ENCODING_BITMAP_ROARING < (1 << 4), "robj encoding must fit in 4 bits");
+static_assert(OBJ_REFCOUNT_BITS == 23, "robj refcount must keep 23 bits");
+static_assert(sizeof(robj) == 2 * sizeof(uint32_t) + sizeof(void *),
+              "robj header must stay two 32-bit words plus ptr");
+
 /* Map a metadata ID (bit index) to its compacted slot number among set bits,
  * then return a pointer to that slot. Caller must ensure the ID bit is set. */
 uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {

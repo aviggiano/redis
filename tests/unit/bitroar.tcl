@@ -942,6 +942,34 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
         assert_equal [r debug bitmap-raw bitmap:restored] $raw
     }
 
+    test {Roaring bitmap encoding stays distinct from other encodings across debug reload} {
+        set keys {bitmap:enc bitmap:enc:int bitmap:enc:raw bitmap:enc:hash bitmap:enc:set}
+        r del {*}$keys
+        r set bitmap:enc [binary format H* 80]
+        convert_string_bitmap_to_roaring r bitmap:enc
+        r set bitmap:enc:int 12345
+        r set bitmap:enc:raw [string repeat x 100]
+        r hset bitmap:enc:hash field value
+        r sadd bitmap:enc:set 1 2 3
+
+        set before {}
+        foreach key $keys {
+            lappend before [r object encoding $key]
+        }
+        assert_equal bitmap-roaring [lindex $before 0]
+        assert_equal 1 [llength [lsearch -all $before bitmap-roaring]]
+
+        r debug reload
+        set after {}
+        foreach key $keys {
+            lappend after [r object encoding $key]
+        }
+        assert_equal $before $after
+        assert_equal 1 [r object refcount bitmap:enc]
+        assert_match {*refcount:1 encoding:bitmap-roaring *} [r debug object bitmap:enc]
+        r del {*}$keys
+    }
+
     test {RESTORE REPLACE preserves explicit string and Roaring bitmap transitions} {
         set raw [binary format H* 80400100080000]
 
