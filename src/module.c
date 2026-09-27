@@ -15221,7 +15221,7 @@ int RM_GetContextFlagsAll(void) {
  *        }
  */
 int RM_GetKeyspaceNotificationFlagsAll(void) {
-    return _REDISMODULE_NOTIFY_NEXT - 1;
+    return (_REDISMODULE_NOTIFY_NEXT - 1) & ~_REDISMODULE_NOTIFY_UNUSED;
 }
 
 /**

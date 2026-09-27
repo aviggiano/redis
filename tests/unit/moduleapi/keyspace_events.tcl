@@ -120,6 +120,19 @@ tags "modules external:skip" {
             assert_equal [expr {$before_string + 1}] [r keyspace.string_callback_count]
         }
 
+        test "Keyspace notifications: GetKeyspaceNotificationFlagsAll reports only supported classes" {
+            set flags [r keyspace.notification_flags_all]
+            # REDISMODULE_NOTIFY_BITMAP must use a bit that older servers don't
+            # report, so modules can detect it.
+            assert {$flags & (1<<25)}
+            # Bit 18 is not assigned to any class.
+            assert {!($flags & (1<<18))}
+            # REDISMODULE_NOTIFY_RATE_LIMIT exists only in GCRA builds.
+            if {[lindex [r command info gcra] 0] eq {}} {
+                assert {!($flags & (1<<24))}
+            }
+        }
+
         test "Keyspace notifications: bitmap conversion module contract" {
             set key bitmap:transition:setbit
 

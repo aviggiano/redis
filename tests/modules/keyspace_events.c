@@ -681,6 +681,14 @@ static int GetBitmapTransitionUnlinkCountCommand(RedisModuleCtx *ctx, RedisModul
     return RedisModule_ReplyWithLongLong(ctx, bitmap_transition_unlink_count);
 }
 
+static int GetNotificationFlagsAllCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    if (argc != 1)
+        return RedisModule_WrongArity(ctx);
+
+    return RedisModule_ReplyWithLongLong(ctx, RedisModule_GetKeyspaceNotificationFlagsAll());
+}
+
 static int GetKeyTypeCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 2)
         return RedisModule_WrongArity(ctx);
@@ -841,6 +849,10 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     }
 
     if (RedisModule_CreateCommand(ctx, "keyspace.bitmap_transition_unlink_count", GetBitmapTransitionUnlinkCountCommand, "readonly", 0, 0, 0) == REDISMODULE_ERR){
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_CreateCommand(ctx, "keyspace.notification_flags_all", GetNotificationFlagsAllCommand, "", 0, 0, 0) == REDISMODULE_ERR){
         return REDISMODULE_ERR;
     }
 

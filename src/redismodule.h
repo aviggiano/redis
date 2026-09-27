@@ -249,7 +249,6 @@ This flag should not be used directly by the module.
 #define REDISMODULE_NOTIFY_OVERWRITTEN (1<<15)   /* o, key overwrite notification */
 #define REDISMODULE_NOTIFY_TYPE_CHANGED (1<<16) /* c, key type changed notification */
 #define REDISMODULE_NOTIFY_KEY_TRIMMED (1<<17) /* module only key space notification, indicates a key trimmed during slot migration */
-#define REDISMODULE_NOTIFY_BITMAP (1<<18)     /* b, bitmap key space notification */
 
 #define REDISMODULE_NOTIFY_SUBKEYSPACE (1<<19)      /* S */
 #define REDISMODULE_NOTIFY_SUBKEYEVENT (1<<20)      /* T */
@@ -259,14 +258,23 @@ This flag should not be used directly by the module.
 #ifdef ENABLE_GCRA
 #define REDISMODULE_NOTIFY_RATE_LIMIT (1<<24) /* r, rate limit event */
 #endif
+#define REDISMODULE_NOTIFY_BITMAP (1<<25)     /* b, bitmap key space notification */
 
 /* Next notification flag, must be updated when adding new flags above!
 This flag should not be used directly by the module.
  * Use RedisModule_GetKeyspaceNotificationFlagsAll instead. */
+#define _REDISMODULE_NOTIFY_NEXT (1<<26)
+
+/* Bits below _REDISMODULE_NOTIFY_NEXT that are not a notification class in
+ * this build, and are therefore not reported by
+ * RedisModule_GetKeyspaceNotificationFlagsAll. Bit 18 must stay unused since
+ * older servers already report it as supported. Bit 24 is
+ * REDISMODULE_NOTIFY_RATE_LIMIT, which only exists with ENABLE_GCRA.
+ * This flag should not be used directly by the module. */
 #ifdef ENABLE_GCRA
-#define _REDISMODULE_NOTIFY_NEXT (1<<25)
+#define _REDISMODULE_NOTIFY_UNUSED (1<<18)
 #else
-#define _REDISMODULE_NOTIFY_NEXT (1<<24)
+#define _REDISMODULE_NOTIFY_UNUSED ((1<<18) | (1<<24))
 #endif
 
 /* Delivery flags for RM_SubscribeToKeyspaceEventsWithSubkeys.
