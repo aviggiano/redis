@@ -32,6 +32,40 @@ proc seed_roaring_bitmap {key bits} {
     create_roaring_bitmap_from_bits r $key $bits
 }
 
+# Set bits of the existing Roaring bitmap 'key' inside the 2^16-bit chunk that
+# starts at bit 'base', shaped for one container kind: a few scattered bits
+# for an array, thousands of random bits for a bitset, or one stretch of
+# consecutive bits for a run. The run stays an array or bitset until BITOP
+# run-optimizes a copy of the bitmap.
+proc add_roaring_container_bits {key base kind} {
+    set ops {}
+    switch $kind {
+        array {
+            set n [expr {1 + [randomInt 40]}]
+            for {set j 0} {$j < $n} {incr j} {
+                lappend ops set u1 [expr {$base + [randomInt 65536]}] 1
+            }
+        }
+        bitset {
+            # About 32 set bits per random word, so well over the 4096 an
+            # array holds, in too many runs to become a run container.
+            for {set j 0} {$j < 160} {incr j} {
+                lappend ops set i64 [expr {$base + 64 * [randomInt 1024]}] \
+                    [expr {[randomInt 4294967296] * 4294967296 +
+                           [randomInt 4294967296] - 9223372036854775808}]
+            }
+        }
+        run {
+            set start [expr {$base + 64 * [randomInt 512]}]
+            set n [expr {1 + [randomInt 256]}]
+            for {set j 0} {$j < $n} {incr j} {
+                lappend ops set i64 [expr {$start + 64 * $j}] -1
+            }
+        }
+    }
+    r bitfield $key {*}$ops
+}
+
 # Extract the raw string payload from a bitmap DUMP. It starts with the RDB
 # type byte followed by the logical byte length and the portable blob length.
 # Tests using this helper disable RDB compression, so both lengths use ordinary
@@ -1237,6 +1271,115 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
         r config set proto-max-bulk-len $oldval
     }
 
+    test {Roaring bitmap streamed RDB payload matches CRoaring across container shapes} {
+        # Bits at or above 2^32 need a logical length above 512MB. 2^31-1 is
+        # the largest limit a 32-bit build accepts, and it reaches the third
+        # high-32 bucket.
+        set old_limit [config_get_set proto-max-bulk-len 2147483647]
+        set old_default [config_get_set bitmap-default-roaring yes]
+        set old_compression [lindex [r config get rdbcompression] 1]
+
+        set keys {}
+        for {set i 0} {$i < 20} {incr i} {
+            set key bitmap:stream:$i
+            r del $key $key:opt
+            # Cycle the per-bucket container count around 4, where a 32-bit
+            # portable bitmap with run containers gains its offset table, and
+            # the set of high-32 buckets; 20 keys cover every combination.
+            set count [lindex {1 3 4 7} [expr {$i % 4}]]
+            set buckets [lindex {{0} {0 1} {1 2} {0 1 2} {2}} [expr {$i % 5}]]
+            foreach high32 $buckets {
+                set chunks {}
+                while {[llength $chunks] < $count} {
+                    set low16 [randomInt 65536]
+                    if {$low16 ni $chunks} {lappend chunks $low16}
+                }
+                foreach low16 $chunks {
+                    add_roaring_container_bits $key \
+                        [expr {($high32 << 32) + ($low16 << 16)}] \
+                        [lindex {array bitset run} [randomInt 3]]
+                }
+            }
+            # BITOP run-optimizes its result, turning the stretches of
+            # consecutive bits into run containers.
+            r bitop or $key:opt $key
+            lappend keys $key $key:opt
+        }
+
+        foreach key $keys {
+            assert_equal OK [r debug bitmap-portable-check $key]
+        }
+
+        # The check above only covers the run container layout if BITOP
+        # really produced some. After the bucket count and high 32 bits, a
+        # payload's first bucket starts with cookie 12347 when it has one.
+        r config set rdbcompression no
+        set run_buckets 0
+        foreach key $keys {
+            binary scan [roaring_portable_payload [r dump $key]] x12su cookie
+            if {$cookie == 12347} {incr run_buckets}
+        }
+        assert_morethan $run_buckets 0
+
+        # Loading keeps every container as serialized, so DUMP/RESTORE and
+        # DEBUG RELOAD round trips must reproduce the exact payload.
+        foreach compression {no yes} {
+            r config set rdbcompression $compression
+            set dumps {}
+            foreach key $keys {
+                set dump [r dump $key]
+                r restore bitmap:stream:restored 0 $dump replace
+                assert_equal $dump [r dump bitmap:stream:restored]
+                lappend dumps $dump
+            }
+            r del bitmap:stream:restored
+            r debug reload
+            foreach key $keys dump $dumps {
+                assert_equal $dump [r dump $key]
+            }
+        }
+
+        r del {*}$keys
+        r config set rdbcompression $old_compression
+        r config set bitmap-default-roaring $old_default
+        r config set proto-max-bulk-len $old_limit
+    }
+
+    test {Roaring bitmap payloads above 1MB are streamed uncompressed} {
+        set old_compression [config_get_set rdbcompression yes]
+
+        # A repeated byte keeps every chunk a bitset container that LZF can
+        # shrink. The 64KB payload is under the 1MB compression limit and is
+        # still compressed; the 2MB one is past it and spans several 256KB
+        # streaming chunks.
+        foreach {size compressed} {65536 1 2097152 0} {
+            set raw [string repeat [binary format H* 5a] $size]
+            r del bitmap:stream:big bitmap:stream:big:restored
+            r set bitmap:stream:big $raw
+            convert_string_bitmap_to_roaring r bitmap:stream:big
+            assert_equal OK [r debug bitmap-portable-check bitmap:stream:big]
+
+            set dump [r dump bitmap:stream:big]
+            if {$compressed} {
+                assert_lessthan [string length $dump] [expr {$size / 8}]
+            } else {
+                assert_morethan [string length $dump] $size
+            }
+            r restore bitmap:stream:big:restored 0 $dump
+            assert_equal $raw [r debug bitmap-raw bitmap:stream:big:restored]
+        }
+
+        foreach compression {yes no} {
+            r config set rdbcompression $compression
+            r debug reload
+            assert_equal bitmap [r type bitmap:stream:big]
+            assert_equal $raw [r debug bitmap-raw bitmap:stream:big]
+        }
+
+        r del bitmap:stream:big bitmap:stream:big:restored
+        r config set rdbcompression $old_compression
+    }
+
     test {Roaring bitmap lazyfree preserves the container-count threshold} {
         r config resetstat
         r config set bitmap-default-roaring yes
@@ -1382,6 +1525,44 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "external:skip" "clu
         assert_equal $raw [r debug bitmap-raw bitmap:aof:transition:roaring]
         assert_equal string [r type bitmap:aof:transition:string]
         assert_equal $raw [r get bitmap:aof:transition:string]
+    }
+
+    test {AOF rewrite streams large and multi-bucket Roaring bitmap payloads} {
+        r flushall
+        r config set appendonly yes
+        waitForBgrewriteaof r
+        r config set auto-aof-rewrite-percentage 0
+        set old_limit [config_get_set proto-max-bulk-len 2147483647]
+        set old_default [config_get_set bitmap-default-roaring yes]
+
+        # The RESTORE payload is written in several chunks with an
+        # incrementally computed CRC64, which loading the AOF verifies.
+        set raw [string repeat [binary format H* 5a] 2097152]
+        r set bitmap:aof:stream:big $raw
+        convert_string_bitmap_to_roaring r bitmap:aof:stream:big
+        foreach high32 {0 1 2} {
+            foreach low16 {0 1 2 3 65535} kind {array bitset run array bitset} {
+                add_roaring_container_bits bitmap:aof:stream:buckets \
+                    [expr {($high32 << 32) + ($low16 << 16)}] $kind
+            }
+        }
+        r bitop or bitmap:aof:stream:runs bitmap:aof:stream:buckets
+        set keys {bitmap:aof:stream:big bitmap:aof:stream:buckets bitmap:aof:stream:runs}
+        set dumps {}
+        foreach key $keys {lappend dumps [r dump $key]}
+
+        r bgrewriteaof
+        waitForBgrewriteaof r
+        r debug loadaof
+
+        foreach key $keys dump $dumps {
+            assert_equal bitmap [r type $key]
+            assert_equal $dump [r dump $key]
+        }
+        assert_equal $raw [r debug bitmap-raw bitmap:aof:stream:big]
+
+        r config set bitmap-default-roaring $old_default
+        r config set proto-max-bulk-len $old_limit
     }
 }
 

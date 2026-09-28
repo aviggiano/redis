@@ -1146,24 +1146,41 @@ static ssize_t rdbSaveArraySlice(rio *rdb, arSlice *s, uint64_t slice_id,
  * zero bits are observable through bitmap commands but are not represented
  * by Roaring containers. The payload size is proportional to the resident
  * containers, never to the highest set bit, and the same format is shared
- * by RDB snapshots, DUMP/RESTORE, and the RDB payloads used by AOF. */
+ * by RDB snapshots, DUMP/RESTORE, and the RDB payloads used by AOF.
+ *
+ * LZF needs the whole payload in memory, so only payloads up to
+ * RDB_BITMAP_COMPRESS_MAX_BYTES are serialized into a buffer and compressed.
+ * Larger ones, and every payload when compression is off, are streamed as a
+ * verbatim RDB string, so a fork child never holds a serialized copy of a
+ * large bitmap. The loader reads both encodings. */
+#define RDB_BITMAP_COMPRESS_MAX_BYTES (1024*1024)
+
+static int rdbSaveBitmapChunk(const void *buf, size_t len, void *privdata) {
+    return rdbWriteRaw(privdata, (void *)buf, len) == -1 ? C_ERR : C_OK;
+}
+
 static ssize_t rdbSaveBitmapObject(rio *rdb, const robj *o) {
     ssize_t n, nwritten = 0;
     uint64_t byte_len = bitroarLen(o);
-    sds payload;
+    size_t payload_len = bitroarPortableSize(o);
 
     if ((n = rdbSaveLen(rdb, byte_len)) == -1) return -1;
     nwritten += n;
 
-    payload = bitroarSerializePortable(o);
-    if ((n = rdbSaveRawString(rdb, (unsigned char *)payload, sdslen(payload))) == -1) {
+    if (server.rdb_compression && payload_len <= RDB_BITMAP_COMPRESS_MAX_BYTES) {
+        sds payload = bitroarSerializePortable(o, payload_len);
+        n = rdbSaveRawString(rdb, (unsigned char *)payload, payload_len);
         sdsfree(payload);
-        return -1;
+        if (n == -1) return -1;
+        return nwritten + n;
     }
-    nwritten += n;
-    sdsfree(payload);
 
-    return nwritten;
+    if ((n = rdbSaveLen(rdb, payload_len)) == -1) return -1;
+    nwritten += n;
+    /* A NULL rio only measures the size (DEBUG OBJECT). */
+    if (rdb && bitroarWritePortable(o, payload_len, rdbSaveBitmapChunk, rdb) != C_OK)
+        return -1;
+    return nwritten + payload_len;
 }
 
 static robj *rdbLoadBitmapObject(rio *rdb) {

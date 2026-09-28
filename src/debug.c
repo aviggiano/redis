@@ -447,6 +447,9 @@ void debugCommand(client *c) {
 "    Server will sleep before flushing the AOF, this is used for testing.",
 "ASSERT",
 "    Crash by assertion failed.",
+"BITMAP-PORTABLE-CHECK <key>",
+"    Verify that the streamed RDB serialization of a Roaring bitmap key matches",
+"    CRoaring's portable serialization byte for byte.",
 "BITMAP-RAW <key>",
 "    Return the raw byte materialization of a Roaring bitmap key.",
 "CHANGE-REPL-ID",
@@ -1010,6 +1013,14 @@ NULL
             return;
         }
         addReplyBulkSds(c, raw);
+    } else if (!strcasecmp(c->argv[1]->ptr,"bitmap-portable-check") && c->argc == 3) {
+        kvobj *kv = lookupKeyReadOrReply(c, c->argv[2], shared.nokeyerr);
+        if (kv == NULL || checkType(c, kv, OBJ_BITMAP)) return;
+
+        if (bitroarPortableMatchesForDebug(kv))
+            addReply(c, shared.ok);
+        else
+            addReplyError(c, "streamed portable serialization differs from CRoaring's");
     } else if (!strcasecmp(c->argv[1]->ptr,"enable-keymeta-runtime-registration") &&
                c->argc == 3)
     {

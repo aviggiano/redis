@@ -698,6 +698,16 @@ start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 
             R 1 xadd $stream_key * item $i
         }
 
+        # A big Roaring bitmap is sent as a RESTORE whose payload is streamed
+        # in chunks. SETBIT converts the string with bitmap-default-roaring.
+        set bitmap_key [slot_key 0 bitmap_key]
+        R 1 set $bitmap_key [string repeat [binary format H* 5a] 2097152]
+        set old_default [lindex [R 1 config get bitmap-default-roaring] 1]
+        R 1 config set bitmap-default-roaring yes
+        R 1 setbit $bitmap_key 0 0
+        R 1 config set bitmap-default-roaring $old_default
+        assert_equal bitmap [R 1 type $bitmap_key]
+
         # migrate slot 0-100 to R 0
         R 0 CLUSTER MIGRATION IMPORT 0 100
         wait_for_asm_done
@@ -707,6 +717,8 @@ start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 
         assert_equal 1000 [R 0 zcard $zset_key]
         assert_equal 1000 [R 0 hlen $hash_key]
         assert_equal 1000 [R 0 xlen $stream_key]
+        assert_equal bitmap [R 0 type $bitmap_key]
+        assert_equal [expr {2097152 * 4}] [R 0 bitcount $bitmap_key]
         # migrate slot 0-100 to R 1
         R 1 CLUSTER MIGRATION IMPORT 0 100
         wait_for_asm_done

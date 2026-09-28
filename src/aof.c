@@ -12,6 +12,7 @@
 #include "rio.h"
 #include "functions.h"
 #include "cluster_asm.h"
+#include "bitroar.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -2845,20 +2846,57 @@ int rewriteModuleObject(rio *r, robj *key, robj *o, int dbid) {
     return io.error ? 0 : 1;
 }
 
+/* Sink for rewriteBitmapObject(): forwards the RESTORE payload to the AOF and
+ * folds it into the payload's CRC64. */
+typedef struct rewriteBitmapPayload {
+    rio *r;
+    uint64_t crc;
+} rewriteBitmapPayload;
+
+static int rewriteBitmapPayloadWrite(const void *buf, size_t len, void *privdata) {
+    rewriteBitmapPayload *payload = privdata;
+    payload->crc = crc64(payload->crc, buf, len);
+    return rioWrite(payload->r, buf, len) ? C_OK : C_ERR;
+}
+
+/* Emit RESTORE key 0 <payload> REPLACE. The payload is streamed instead of
+ * being built by createDumpPayload(), so the fork child never holds a copy of
+ * a large bitmap's serialization. It is what DUMP produces when the portable
+ * payload is stored verbatim: the object type, the rdbSaveBitmapObject()
+ * fields, then the RDB version and CRC64 footer. KeyMeta is emitted below
+ * through its AOF callbacks, so the payload must not contain another copy. */
 int rewriteBitmapObject(rio *r, robj *key, robj *o, int dbid) {
-    rio payload;
-    /* KeyMeta is emitted below through its AOF callbacks, so the RESTORE
-     * payload must not contain another copy. */
-    createDumpPayload(&payload, o, key, dbid, DUMP_PAYLOAD_SKIP_KEY_META, 0);
+    rewriteBitmapPayload payload = {r, 0};
+    size_t portable_len = bitroarPortableSize(o);
+    unsigned char footer[10];
+    rio header;
+    UNUSED(dbid);
+
+    rioInitWithBuffer(&header, sdsempty());
+    serverAssert(rdbSaveObjectType(&header, o) != -1 &&
+                 rdbSaveLen(&header, bitroarLen(o)) != -1 &&
+                 rdbSaveLen(&header, portable_len) != -1);
+    sds head = header.io.buffer.ptr;
 
     int ok = rioWriteBulkCount(r,'*',5) &&
              rioWriteBulkString(r,"RESTORE",7) &&
              rioWriteBulkObject(r,key) &&
              rioWriteBulkString(r,"0",1) &&
-             rioWriteBulkString(r,payload.io.buffer.ptr,sdslen(payload.io.buffer.ptr)) &&
-             rioWriteBulkString(r,"REPLACE",7);
-    sdsfree(payload.io.buffer.ptr);
-    return ok;
+             rioWriteBulkCount(r,'$',(long)(sdslen(head)+portable_len+sizeof(footer))) &&
+             rewriteBitmapPayloadWrite(head,sdslen(head),&payload) == C_OK &&
+             bitroarWritePortable(o,portable_len,rewriteBitmapPayloadWrite,&payload) == C_OK;
+    sdsfree(head);
+    if (!ok) return 0;
+
+    /* RDB version and CRC64, both little endian, as in createDumpPayload(). */
+    footer[0] = RDB_VERSION & 0xff;
+    footer[1] = (RDB_VERSION >> 8) & 0xff;
+    uint64_t crc = crc64(payload.crc, footer, 2);
+    memrev64ifbe(&crc);
+    memcpy(footer+2, &crc, sizeof(crc));
+    return rioWrite(r,footer,sizeof(footer)) &&
+           rioWrite(r,"\r\n",2) &&
+           rioWriteBulkString(r,"REPLACE",7);
 }
 
 static int rewriteFunctions(rio *aof) {

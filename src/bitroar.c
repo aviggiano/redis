@@ -1202,17 +1202,266 @@ sds bitroarMaterializeForDebug(const robj *o) {
     return bitroarMaterializeRaw(o, 1, 0);
 }
 
-/* Serialize the internal containers in the RoaringFormatSpec 64-bit portable
- * format. Its size is proportional to resident bitmap data rather than the
- * logical byte length, so sparse bitmaps with high offsets remain cheap to
- * persist. */
-sds bitroarSerializePortable(const robj *o) {
-    bitroar *bitmap = bitroarGet(o);
-    size_t len = roaring64_bitmap_portable_size_in_bytes(bitmap->roaring);
-    sds payload = sdsnewlen(SDS_NOINIT, len);
-    size_t written = roaring64_bitmap_portable_serialize(bitmap->roaring, payload);
+/* --- Portable serialization ---
+ *
+ * The internal containers are persisted in the RoaringFormatSpec 64-bit
+ * portable format. Its size is proportional to resident bitmap data rather
+ * than the logical byte length, so sparse bitmaps with high offsets remain
+ * cheap to persist.
+ *
+ * CRoaring can only serialize into one buffer holding the whole payload,
+ * which for a dense bitmap is as large as the bitmap itself and, in a fork
+ * child, is private memory. The writer below walks the containers instead
+ * and emits the same bytes as roaring64_bitmap_portable_serialize() through
+ * a bounded staging buffer: the bucket count, then for each distinct high
+ * 32-bit key that key followed by a 32-bit portable bitmap laid out as in
+ * CRoaring's ra_portable_serialize(). DEBUG BITMAP-PORTABLE-CHECK compares
+ * both serializations. */
+
+/* Staging buffer size. A staged item is never split, so it must fit the
+ * largest serialized container: a run container with as many runs as its
+ * 16-bit run count can describe takes 2 + 4 * 65535 bytes. */
+#define BITROAR_PORTABLE_CHUNK_BYTES (256 * 1024)
+
+typedef struct bitroarPortableWriter {
+    bitroarWriteCallback *write;
+    void *privdata;
+    char *buf;
+    size_t cap;     /* Staging buffer size. */
+    size_t used;    /* Staged bytes not yet passed to 'write'. */
+    size_t written; /* Bytes passed to 'write', or dropped after an error. */
+    int err;        /* Set once 'write' fails; later bytes are dropped. */
+} bitroarPortableWriter;
+
+static void bitroarPortableFlush(bitroarPortableWriter *w) {
+    if (w->used && !w->err && w->write(w->buf, w->used, w->privdata) != C_OK)
+        w->err = 1;
+    w->written += w->used;
+    w->used = 0;
+}
+
+/* Return room for 'len' contiguous staged bytes, flushing first if needed. */
+static char *bitroarPortableReserve(bitroarPortableWriter *w, size_t len) {
+    serverAssert(len <= w->cap);
+    if (w->cap - w->used < len) bitroarPortableFlush(w);
+    char *p = w->buf + w->used;
+    w->used += len;
+    return p;
+}
+
+static void bitroarPortablePut8(bitroarPortableWriter *w, uint8_t v) {
+    *bitroarPortableReserve(w, 1) = (char)v;
+}
+
+static void bitroarPortablePut16(bitroarPortableWriter *w, uint16_t v) {
+    v = intrev16ifbe(v);
+    memcpy(bitroarPortableReserve(w, sizeof(v)), &v, sizeof(v));
+}
+
+static void bitroarPortablePut32(bitroarPortableWriter *w, uint32_t v) {
+    v = intrev32ifbe(v);
+    memcpy(bitroarPortableReserve(w, sizeof(v)), &v, sizeof(v));
+}
+
+static void bitroarPortablePut64(bitroarPortableWriter *w, uint64_t v) {
+    v = intrev64ifbe(v);
+    memcpy(bitroarPortableReserve(w, sizeof(v)), &v, sizeof(v));
+}
+
+static uint32_t bitroarArtKeyToHigh32(const art_key_chunk_t key[ART_KEY_BYTES]) {
+    return (uint32_t)(bitroarArtKeyToHigh48(key) >> 16);
+}
+
+/* Write the 32-bit portable bitmap made of the 'count' containers starting
+ * at 'first', which all share one high 32-bit key. */
+static void bitroarPortableWriteBucket(bitroarPortableWriter *w,
+                                       const roaring64_bitmap_t *r,
+                                       const art_iterator_t *first,
+                                       uint32_t count, int hasrun)
+{
+    art_iterator_t it;
+    uint32_t offset;
+
+    if (hasrun) {
+        bitroarPortablePut32(w, SERIAL_COOKIE | ((count - 1) << 16));
+        /* One bit per container flags the run containers. */
+        uint8_t runs = 0;
+        it = *first;
+        for (uint32_t i = 0; i < count; i++, art_iterator_next(&it)) {
+            if (roaring64_leaf_typecode(*it.value) == RUN_CONTAINER_TYPE)
+                runs |= 1 << (i % 8);
+            if (i % 8 == 7 || i == count - 1) {
+                bitroarPortablePut8(w, runs);
+                runs = 0;
+            }
+        }
+        offset = 4 + (count + 7) / 8 +
+                 (count < NO_OFFSET_THRESHOLD ? 4 : 8) * count;
+    } else {
+        bitroarPortablePut32(w, SERIAL_COOKIE_NO_RUNCONTAINER);
+        bitroarPortablePut32(w, count);
+        offset = 4 + 4 + 8 * count;
+    }
+
+    /* Low 16 bits of each container key, and its cardinality minus one. */
+    it = *first;
+    for (uint32_t i = 0; i < count; i++, art_iterator_next(&it)) {
+        roaring64_leaf_t leaf = (roaring64_leaf_t)*it.value;
+        const container_t *c = r->containers[roaring64_leaf_index(leaf)];
+        bitroarPortablePut16(w, (uint16_t)bitroarArtKeyToHigh48(it.key));
+        bitroarPortablePut16(w, (uint16_t)(container_get_cardinality(
+            c, roaring64_leaf_typecode(leaf)) - 1));
+    }
+
+    /* Container offsets, which the format omits for small bitmaps that
+     * contain run containers. */
+    if (!hasrun || count >= NO_OFFSET_THRESHOLD) {
+        it = *first;
+        for (uint32_t i = 0; i < count; i++, art_iterator_next(&it)) {
+            roaring64_leaf_t leaf = (roaring64_leaf_t)*it.value;
+            bitroarPortablePut32(w, offset);
+            offset += container_size_in_bytes(
+                r->containers[roaring64_leaf_index(leaf)],
+                roaring64_leaf_typecode(leaf));
+        }
+    }
+
+    it = *first;
+    for (uint32_t i = 0; i < count && !w->err; i++, art_iterator_next(&it)) {
+        roaring64_leaf_t leaf = (roaring64_leaf_t)*it.value;
+        const container_t *c = r->containers[roaring64_leaf_index(leaf)];
+        uint8_t typecode = roaring64_leaf_typecode(leaf);
+        int32_t size = container_size_in_bytes(c, typecode);
+        char *dst = bitroarPortableReserve(w, size);
+        serverAssert(container_write(c, typecode, dst) == size);
+    }
+}
+
+/* Stream the portable format through a 'cap' byte staging buffer. Sets
+ * '*written' to the number of bytes produced. */
+static int bitroarPortableStream(const roaring64_bitmap_t *r, size_t cap,
+                                 bitroarWriteCallback *write, void *privdata,
+                                 size_t *written)
+{
+    bitroarPortableWriter w = {write, privdata, zmalloc(cap), cap, 0, 0, 0};
+    art_iterator_t it;
+    uint64_t buckets = 0;
+    uint32_t high32 = 0;
+
+    it = art_init_iterator((art_t *)&r->art, true);
+    for (; it.value != NULL; art_iterator_next(&it)) {
+        if (buckets == 0 || bitroarArtKeyToHigh32(it.key) != high32) {
+            high32 = bitroarArtKeyToHigh32(it.key);
+            buckets++;
+        }
+    }
+    bitroarPortablePut64(&w, buckets);
+
+    it = art_init_iterator((art_t *)&r->art, true);
+    while (it.value != NULL && !w.err) {
+        art_iterator_t first = it;
+        uint32_t count = 0;
+        int hasrun = 0;
+
+        /* The container count and whether any of them is a run container
+         * select the bucket's header layout. */
+        high32 = bitroarArtKeyToHigh32(it.key);
+        while (it.value != NULL && bitroarArtKeyToHigh32(it.key) == high32) {
+            if (roaring64_leaf_typecode(*it.value) == RUN_CONTAINER_TYPE)
+                hasrun = 1;
+            count++;
+            art_iterator_next(&it);
+        }
+        bitroarPortablePut32(&w, high32);
+        bitroarPortableWriteBucket(&w, r, &first, count, hasrun);
+    }
+    bitroarPortableFlush(&w);
+    zfree(w.buf);
+    *written = w.written;
+    return w.err ? C_ERR : C_OK;
+}
+
+size_t bitroarPortableSize(const robj *o) {
+    return roaring64_bitmap_portable_size_in_bytes(bitroarGet(o)->roaring);
+}
+
+/* Stream the portable serialization, whose size 'len' must come from
+ * bitroarPortableSize(), to 'write' in chunks of at most
+ * BITROAR_PORTABLE_CHUNK_BYTES. Returns C_ERR if 'write' failed. */
+int bitroarWritePortable(const robj *o, size_t len,
+                         bitroarWriteCallback *write, void *privdata)
+{
+    size_t cap = len < BITROAR_PORTABLE_CHUNK_BYTES ? len : BITROAR_PORTABLE_CHUNK_BYTES;
+    size_t written;
+
+    if (bitroarPortableStream(bitroarGet(o)->roaring, cap, write, privdata,
+                              &written) != C_OK) return C_ERR;
+    /* Callers already emitted 'len' as the payload length. */
     serverAssert(written == len);
+    return C_OK;
+}
+
+static int bitroarPortableAppend(const void *buf, size_t len, void *privdata) {
+    sds *payload = privdata;
+    *payload = sdscatlen(*payload, buf, len);
+    return C_OK;
+}
+
+/* Serialize into an sds of 'len' bytes, the value of bitroarPortableSize(). */
+sds bitroarSerializePortable(const robj *o, size_t len) {
+    sds payload = sdsnewlen(SDS_NOINIT, len);
+    sdssetlen(payload, 0);
+    serverAssert(bitroarWritePortable(o, len, bitroarPortableAppend, &payload) == C_OK);
     return payload;
+}
+
+typedef struct bitroarPortableCompare {
+    const char *expected;
+    size_t len;
+    size_t pos;
+} bitroarPortableCompare;
+
+static int bitroarPortableCompareChunk(const void *buf, size_t len, void *privdata) {
+    bitroarPortableCompare *cmp = privdata;
+    if (len > cmp->len - cmp->pos ||
+        memcmp(cmp->expected + cmp->pos, buf, len) != 0) return C_ERR;
+    cmp->pos += len;
+    return C_OK;
+}
+
+/* Return 1 if the streamed serialization is byte-identical to CRoaring's
+ * roaring64_bitmap_portable_serialize(). Streams once with the production
+ * staging buffer and once with the smallest one that fits every staged item,
+ * which flushes at nearly every field and container boundary. */
+int bitroarPortableMatchesForDebug(const robj *o) {
+    const roaring64_bitmap_t *r = bitroarGet(o)->roaring;
+    size_t len = roaring64_bitmap_portable_size_in_bytes(r);
+    char *expected = zmalloc(len);
+    int match = roaring64_bitmap_portable_serialize(r, expected) == len;
+
+    size_t min_cap = sizeof(uint64_t); /* The widest header field. */
+    art_iterator_t it = art_init_iterator((art_t *)&r->art, true);
+    for (; it.value != NULL; art_iterator_next(&it)) {
+        roaring64_leaf_t leaf = (roaring64_leaf_t)*it.value;
+        size_t size = container_size_in_bytes(
+            r->containers[roaring64_leaf_index(leaf)],
+            roaring64_leaf_typecode(leaf));
+        if (size > min_cap) min_cap = size;
+    }
+
+    size_t caps[2] = {
+        len < BITROAR_PORTABLE_CHUNK_BYTES ? len : BITROAR_PORTABLE_CHUNK_BYTES,
+        min_cap
+    };
+    for (int i = 0; i < 2 && match; i++) {
+        bitroarPortableCompare cmp = {expected, len, 0};
+        size_t written;
+        match = bitroarPortableStream(r, caps[i], bitroarPortableCompareChunk,
+                                      &cmp, &written) == C_OK &&
+                written == len && cmp.pos == len;
+    }
+    zfree(expected);
+    return match;
 }
 
 typedef struct bitroarOpSource {

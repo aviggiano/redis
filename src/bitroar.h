@@ -59,6 +59,10 @@ typedef enum bitroarOp {
  * Reports one maximal run of set bits as [start, end) bit offsets. */
 typedef void bitroarRangeCallback(uint64_t start, uint64_t end, void *privdata);
 
+/* Called on invocation, per-chunk sink for bitroarWritePortable(). Receives
+ * the next 'len' bytes of the serialization; returns C_OK, or C_ERR to stop. */
+typedef int bitroarWriteCallback(const void *buf, size_t len, void *privdata);
+
 /* Initialization (once at server startup: plugs zmalloc into CRoaring) */
 void bitroarInit(void);
 
@@ -95,9 +99,15 @@ robj *bitroarApplyOp(bitroarOp op, robj **objects, size_t numkeys, uint64_t maxl
 
 /* Serialization. MaterializeForDebug flattens to the logical raw string bytes
  * for DEBUG BITMAP-RAW and rejects lengths above proto-max-bulk-len.
- * SerializePortable emits the RoaringFormatSpec 64-bit portable format, whose
- * size tracks resident data rather than the logical length. */
+ * The rest use the RoaringFormatSpec 64-bit portable format, whose size
+ * (PortableSize) tracks resident data rather than the logical length.
+ * WritePortable streams it through a bounded buffer, so persisting a large
+ * bitmap never holds a whole serialized copy; SerializePortable collects it
+ * into an sds. PortableMatchesForDebug backs DEBUG BITMAP-PORTABLE-CHECK. */
 sds bitroarMaterializeForDebug(const robj *o);
-sds bitroarSerializePortable(const robj *o);
+size_t bitroarPortableSize(const robj *o);
+int bitroarWritePortable(const robj *o, size_t len, bitroarWriteCallback *write, void *privdata);
+sds bitroarSerializePortable(const robj *o, size_t len);
+int bitroarPortableMatchesForDebug(const robj *o);
 
 #endif /* __BITROAR_H */
