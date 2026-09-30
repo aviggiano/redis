@@ -28,7 +28,26 @@ static_assert(sizeof(kvBits) == 1, "kvBits must be a single byte");
 /* type:4, encoding:4, refcount:23 and iskvobj:1 share one 32-bit word. Every
  * encoding must fit in 4 bits: widening 'encoding' would take a bit from
  * 'refcount' and halve the refcount at which incrRefCount() panics. */
-static_assert(OBJ_ENCODING_BITMAP_ROARING < (1 << 4), "robj encoding must fit in 4 bits");
+#define ASSERT_ENCODING_FITS(encoding) \
+    static_assert((unsigned)(encoding) < (1u << OBJ_ENCODING_BITS), \
+                  #encoding " must fit in robj.encoding")
+ASSERT_ENCODING_FITS(OBJ_ENCODING_RAW);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_INT);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_HT);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_BITMAP_ROARING);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_LINKEDLIST);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_ZIPLIST);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_INTSET);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_SKIPLIST);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_EMBSTR);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_QUICKLIST);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_STREAM);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_LISTPACK);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_LISTPACK_EX);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_SLICED_ARRAY);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_TMPL_LP);
+ASSERT_ENCODING_FITS(OBJ_ENCODING_TMPL_ARRAY);
+#undef ASSERT_ENCODING_FITS
 static_assert(OBJ_REFCOUNT_BITS == 23, "robj refcount must keep 23 bits");
 static_assert(sizeof(robj) == 2 * sizeof(uint32_t) + sizeof(void *),
               "robj header must stay two 32-bit words plus ptr");

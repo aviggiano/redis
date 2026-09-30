@@ -95,6 +95,7 @@ struct RedisModuleType;
 #define LRU_CLOCK_RESOLUTION 1000 /* LRU clock resolution in ms */
 
 #define OBJ_NUM_KVMETA_BITS 8
+#define OBJ_ENCODING_BITS 4
 #define OBJ_REFCOUNT_BITS 23
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
@@ -102,7 +103,7 @@ struct RedisModuleType;
 
 struct redisObject {
     unsigned type:4;
-    unsigned encoding:4;
+    unsigned encoding : OBJ_ENCODING_BITS;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     unsigned iskvobj : 1;   /* 1 if this struct serves as a kvobj base */
     

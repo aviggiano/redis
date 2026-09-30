@@ -943,30 +943,42 @@ start_server {tags {"bitmap" "bitmap-roaring" "needs:debug" "cluster:skip"}} {
     }
 
     test {Roaring bitmap encoding stays distinct from other encodings across debug reload} {
-        set keys {bitmap:enc bitmap:enc:int bitmap:enc:raw bitmap:enc:hash bitmap:enc:set}
+        set keys {bitmap:enc bitmap:enc:int bitmap:enc:raw bitmap:enc:hash bitmap:enc:set
+                  bitmap:enc:template-lp bitmap:enc:template-array}
+        set raw [binary format H* 80]
+        set long_value [string repeat x 100]
         r del {*}$keys
-        r set bitmap:enc [binary format H* 80]
+        r set bitmap:enc $raw
         convert_string_bitmap_to_roaring r bitmap:enc
         r set bitmap:enc:int 12345
-        r set bitmap:enc:raw [string repeat x 100]
+        r set bitmap:enc:raw $long_value
         r hset bitmap:enc:hash field value
         r sadd bitmap:enc:set 1 2 3
+        r himport prepare bitmap:enc:fields field other
+        r himport set bitmap:enc:template-lp bitmap:enc:fields value other-value
+        r himport set bitmap:enc:template-array bitmap:enc:fields $long_value other-value
+        r himport discard bitmap:enc:fields
 
-        set before {}
-        foreach key $keys {
-            lappend before [r object encoding $key]
-        }
-        assert_equal bitmap-roaring [lindex $before 0]
-        assert_equal 1 [llength [lsearch -all $before bitmap-roaring]]
+        set expected {bitmap-roaring int raw listpack intset template-listpack template-array}
+        for {set reload 0} {$reload < 2} {incr reload} {
+            if {$reload} { r debug reload }
 
-        r debug reload
-        set after {}
-        foreach key $keys {
-            lappend after [r object encoding $key]
+            set encodings {}
+            foreach key $keys {
+                lappend encodings [r object encoding $key]
+            }
+            assert_equal $expected $encodings
+            assert_equal $raw [r debug bitmap-raw bitmap:enc]
+            assert_equal 12345 [r get bitmap:enc:int]
+            assert_equal $long_value [r get bitmap:enc:raw]
+            assert_equal value [r hget bitmap:enc:hash field]
+            assert_equal {1 2 3} [lsort [r smembers bitmap:enc:set]]
+            assert_equal {value other-value} [r hmget bitmap:enc:template-lp field other]
+            assert_equal [list $long_value other-value] \
+                [r hmget bitmap:enc:template-array field other]
+            assert_equal 1 [r object refcount bitmap:enc]
+            assert_match {*refcount:1 encoding:bitmap-roaring *} [r debug object bitmap:enc]
         }
-        assert_equal $before $after
-        assert_equal 1 [r object refcount bitmap:enc]
-        assert_match {*refcount:1 encoding:bitmap-roaring *} [r debug object bitmap:enc]
         r del {*}$keys
     }
 
